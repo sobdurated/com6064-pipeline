@@ -6,7 +6,7 @@ This repository contains the sequential data processing pipeline for our COM6064
 
 * **Fetch:** Yusuf (`fetch.py`)
 * **Preprocess:** Hamza (`preprocess.py`)
-* **Sentiment:** Ammaar (`sentiment_analysis_pipeline.py`)
+* **Sentiment:** Ammaar (`sentiment_analysis.py`)
 * **Geospatial:** Adel (`geospatial.py`)
 * **Sentiment Aggregation:** Ebraheem (`sentiment_aggregation.py`)
 
