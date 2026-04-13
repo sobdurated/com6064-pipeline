@@ -53,3 +53,9 @@ logs/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# --- Project specific ---
+config/serper_keys.txt
+output/
+state/*.csv
+
