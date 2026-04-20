@@ -38,7 +38,7 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
     # =============================
     # FILTERS (can be dynamic later)
     # =============================
-    START_DATE = datetime(2026, 1, 1)
+    START_DATE = datetime(1950, 1, 1)
     END_DATE = datetime(2026, 12, 31)
 
     FILTER_KEYWORD = None
