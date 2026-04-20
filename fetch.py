@@ -16,7 +16,9 @@ import pandas as pd
 import requests
 import cloudscraper
 from bs4 import BeautifulSoup
-from pymongo import UpdateOne
+from pymongo import UpdateOne, MongoClient
+from dotenv import load_dotenv
+
 
 STEP_NAME = "fetch_scrape"
 
@@ -30,7 +32,8 @@ MAX_PAGES_PER_TOPIC = 5
 
 DEFAULT_LANGUAGE = "tr"
 DEFAULT_SOURCE = "eksisozluk"
-DEFAULT_RAW_COLLECTION = "raw_posts"
+
+DEFAULT_RAW_COLLECTION = "posts_raw"
 DEFAULT_RUNS_COLLECTION = "fetch_runs"
 
 
@@ -186,8 +189,8 @@ def ensure_csv_with_header(path: Path, column_name: str) -> None:
 
 def build_query(level: str, province: str, district: Optional[str], category: str) -> str:
     if level == "district":
-        return f"site:eksisozluk.com {province.lower()} {str(district or '').lower()} {category.lower()}".strip()
-    return f"site:eksisozluk.com {province.lower()} {category.lower()}"
+        return f"site:eksisozluk.com {normalize_lookup(province)} {normalize_lookup(district or '')} {normalize_lookup(category)}".strip()
+    return f"site:eksisozluk.com {normalize_lookup(province)} {normalize_lookup(category)}"
 
 
 def make_fetch_key(level: str, province: str, district: Optional[str], category: str) -> str:
@@ -254,29 +257,34 @@ def load_api_keys(base_dir: Path) -> List[str]:
 def search_google(query: str, num_results: int, api_keys: List[str]) -> Tuple[List[str], int]:
     url = "https://google.serper.dev/search"
     last_error = None
+    payload = {
+        "q": query,
+        "gl": "tr",
+        "hl": "tr",
+        "num": int(num_results),
+    }
 
     for index, api_key in enumerate(api_keys):
         headers = {
             "X-API-KEY": api_key,
             "Content-Type": "application/json",
         }
-        payload = {
-            "q": query,
-            "gl": "tr",
-            "hl": "tr",
-            "num": num_results,
-        }
 
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
-            data = response.json()
         except Exception as exc:
             last_error = exc
             continue
 
+        try:
+            data = response.json()
+        except Exception:
+            data = {}
+
         if response.status_code >= 400:
-            message = f"Serper error for key #{index + 1}: HTTP {response.status_code}"
-            if response.status_code in {401, 403, 429}:
+            details = str(data)[:300] if data else response.text[:300]
+            message = f"Serper error for key #{index + 1}: HTTP {response.status_code} | {details}"
+            if response.status_code in {400, 401, 403, 429}:
                 last_error = RuntimeError(message)
                 continue
             raise RuntimeError(message)
@@ -289,6 +297,7 @@ def search_google(query: str, num_results: int, api_keys: List[str]) -> Tuple[Li
                 continue
             seen.add(link)
             links.append(link)
+
         return links, index
 
     raise RuntimeError(f"All Serper API keys failed. Last error: {last_error}")
@@ -796,6 +805,32 @@ def input_to_tasks(input_data: Any) -> Optional[List[Dict[str, Any]]]:
     return None
 
 
+def build_direct_input_from_args(args) -> Dict[str, Any]:
+    if not args.province and not args.category and not args.district:
+        return {}
+
+    if not args.province or not args.category:
+        raise SystemExit("When using direct CLI arguments, --province and --category are required.")
+    if args.level == "district" and not args.district:
+        raise SystemExit("When level is district, --district is required.")
+
+    result = {
+        "level": args.level,
+        "province": args.province,
+        "district": args.district,
+        "category": args.category,
+    }
+
+    if args.num_results is not None:
+        result["num_results"] = args.num_results
+    if args.max_topics is not None:
+        result["max_topics"] = args.max_topics
+    if args.include_province_level:
+        result["include_province_level"] = True
+
+    return result
+
+
 def run(input_data: Any, context: Dict[str, Any]) -> Any:
     base_dir = Path(context.get("base_dir") or ".")
     db = context.get("db")
@@ -1016,26 +1051,58 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Run fetch step in automatic or targeted mode")
-    parser.add_argument("--input", default=None, help="Optional JSON input for targeted mode")
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(description="Run fetch step directly with MongoDB support")
+    parser.add_argument("--input", default=None, help="Optional JSON input")
     parser.add_argument("--max-topics", type=int, default=None, help="Optional limit on requests to run")
     parser.add_argument("--include-province-level", action="store_true", help="Include province-level tasks in automatic mode")
+
+    parser.add_argument("--level", choices=["district", "province"], default="district", help="Task level")
+    parser.add_argument("--province", default=None, help="Province name")
+    parser.add_argument("--district", default=None, help="District name")
+    parser.add_argument("--category", default=None, help="Category name")
+    parser.add_argument("--num-results", type=int, default=None, help="Number of Serper results to request")
+
     args = parser.parse_args()
 
     demo_input = None
+
     if args.input:
+        raw = str(args.input).strip()
+        if raw.startswith("'") and raw.endswith("'"):
+            raw = raw[1:-1]
         try:
-            demo_input = json.loads(args.input)
+            demo_input = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise SystemExit(f"Invalid JSON for --input: {exc}")
+    else:
+        demo_input = build_direct_input_from_args(args)
 
     if demo_input is None:
         demo_input = {}
 
-    if args.max_topics is not None:
+    if args.max_topics is not None and isinstance(demo_input, dict):
         demo_input["max_topics"] = args.max_topics
-    if args.include_province_level:
+    if args.include_province_level and isinstance(demo_input, dict):
         demo_input["include_province_level"] = True
 
-    demo_context = {"base_dir": ".", "db": None, "mongo_client": None}
-    print(json.dumps(run(demo_input, demo_context), indent=2, ensure_ascii=False))
+    mongo_uri = os.getenv("MONGO_URI")
+    mongo_db_name = os.getenv("MONGO_DB_NAME", "COM6064")
+
+    if not mongo_uri:
+        raise SystemExit("Missing MONGO_URI in .env")
+
+    mongo_client = MongoClient(mongo_uri)
+    mongo_db = mongo_client[mongo_db_name]
+
+    try:
+        demo_context = {
+            "base_dir": ".",
+            "db": mongo_db,
+            "mongo_client": mongo_client,
+        }
+        result = run(demo_input, demo_context)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    finally:
+        mongo_client.close()
