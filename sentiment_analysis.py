@@ -32,7 +32,10 @@ def _chunked(records: List[Dict], size: int) -> Iterable[List[Dict]]:
 def _load_posts_for_inference(collection) -> List[Dict]:
     query = {
         "text": {"$type": "string", "$ne": ""},
-        "sentiment.label": "neutral",
+        "$or": [
+            {"sentiment.model": "pending"},
+            {"sentiment.label": "neutral"},
+        ],
     }
     projection = {"_id": 1, "text": 1}
     return list(collection.find(query, projection))
