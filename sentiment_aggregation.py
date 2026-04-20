@@ -134,7 +134,8 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
 
         dashboard_summary.append(row)
 
-        print(f"Processed: {province}")
+        print("\n--- PROVINCE RESULT ---")
+        print(row)
 
         # =============================
         # SAVE PROVINCE SUMMARY
@@ -208,7 +209,7 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
             upsert=True
         )
 
-    print(f"step completed: {STEP_NAME}")
+    
 
     # =============================
     # OUTPUT TO NEXT STEP
