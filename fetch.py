@@ -33,8 +33,8 @@ MAX_PAGES_PER_TOPIC = 5
 DEFAULT_LANGUAGE = "tr"
 DEFAULT_SOURCE = "eksisozluk"
 
+# MongoDB collection used for scraped posts only
 DEFAULT_RAW_COLLECTION = "posts_raw"
-DEFAULT_RUNS_COLLECTION = "fetch_runs"
 
 
 def normalize_lookup(text: str) -> str:
@@ -489,31 +489,6 @@ def insert_raw_posts_to_mongo(db: Any, raw_posts: List[Dict[str, Any]], collecti
     changed = int(result.upserted_count) + int(result.modified_count)
     return {"inserted_or_updated": changed}
 
-
-def write_run_summary_to_mongo(db: Any, payload: Dict[str, Any], collection_name: str = DEFAULT_RUNS_COLLECTION) -> None:
-    if db is None:
-        return
-
-    try:
-        db[collection_name].insert_one(
-            {
-                "step": payload.get("step"),
-                "status": payload.get("status"),
-                "mode": payload.get("mode"),
-                "run_at": datetime.now(timezone.utc),
-                "output_dir": payload.get("output_dir"),
-                "combined_output_file": payload.get("combined_output_file"),
-                "run_task_count": payload.get("run_task_count"),
-                "fetched_query_count": payload.get("fetched_query_count"),
-                "processed_topic_count": payload.get("processed_topic_count"),
-                "total_urls_found": payload.get("total_urls_found"),
-                "new_posts_in_this_run": payload.get("new_posts_in_this_run"),
-                "combined_post_count": payload.get("combined_post_count"),
-                "mongo_upserted_count": payload.get("mongo_upserted_count", 0),
-            }
-        )
-    except Exception:
-        pass
 
 
 def get_output_path(output_dir: Path, level: str, province: str, district: Optional[str], category: str) -> Path:
@@ -1044,7 +1019,6 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
         },
     }
 
-    write_run_summary_to_mongo(db, result_payload, collection_name=DEFAULT_RUNS_COLLECTION)
     return result_payload
 
 
