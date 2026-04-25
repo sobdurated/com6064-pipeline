@@ -1,4 +1,20 @@
+# Core database connection used by all pipeline steps
 pymongo==4.16.0
 dnspython==2.8.0
+
+# Sentiment analysis step
 transformers==4.41.2
 torch
+numpy
+tqdm
+
+# Fetch step (web scraping, API requests, CSV/data handling)
+pandas
+requests
+cloudscraper
+beautifulsoup4
+python-dotenv
+
+# Preprocess step (text cleaning, emoji handling, stopwords)
+emoji
+nltk
