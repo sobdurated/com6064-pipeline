@@ -4,6 +4,8 @@ import os
 import re
 import time
 import hashlib
+import threading
+import logging
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -15,6 +17,9 @@ import pandas as pd
 import requests
 import cloudscraper
 from bs4 import BeautifulSoup
+from pymongo import UpdateOne, MongoClient
+from dotenv import load_dotenv
+
 
 STEP_NAME = "fetch_scrape"
 
@@ -24,8 +29,19 @@ MAX_RETRIES = 3
 PROVINCE_RESULTS_COUNT = 10
 DISTRICT_RESULTS_COUNT = 5
 PARALLEL_FETCH_WORKERS = 4
+MAX_PAGES_PER_TOPIC = 5
+
 DEFAULT_LANGUAGE = "tr"
 DEFAULT_SOURCE = "eksisozluk"
+
+# MongoDB collection used for scraped posts only
+DEFAULT_RAW_COLLECTION = "posts_raw"
+
+# Safety switch. Keep False for demos/tests so fetch never scans everything by accident.
+ALLOW_AUTOMATIC_FETCH = False
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 
 def normalize_lookup(text: str) -> str:
@@ -43,6 +59,14 @@ def safe_slug(text: str) -> str:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def iso_to_datetime(iso_value: str) -> datetime:
+    value = str(iso_value).replace("Z", "+00:00")
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def try_parse_date_to_iso(raw_value: Any, fallback_iso: Optional[str] = None) -> Optional[str]:
@@ -172,8 +196,8 @@ def ensure_csv_with_header(path: Path, column_name: str) -> None:
 
 def build_query(level: str, province: str, district: Optional[str], category: str) -> str:
     if level == "district":
-        return f"site:eksisozluk.com {province.lower()} {str(district or '').lower()} {category.lower()}".strip()
-    return f"site:eksisozluk.com {province.lower()} {category.lower()}"
+        return f"site:eksisozluk.com {normalize_lookup(province)} {normalize_lookup(district or '')} {normalize_lookup(category)}".strip()
+    return f"site:eksisozluk.com {normalize_lookup(province)} {normalize_lookup(category)}"
 
 
 def make_fetch_key(level: str, province: str, district: Optional[str], category: str) -> str:
@@ -240,29 +264,34 @@ def load_api_keys(base_dir: Path) -> List[str]:
 def search_google(query: str, num_results: int, api_keys: List[str]) -> Tuple[List[str], int]:
     url = "https://google.serper.dev/search"
     last_error = None
+    payload = {
+        "q": query,
+        "gl": "tr",
+        "hl": "tr",
+        "num": int(num_results),
+    }
 
     for index, api_key in enumerate(api_keys):
         headers = {
             "X-API-KEY": api_key,
             "Content-Type": "application/json",
         }
-        payload = {
-            "q": query,
-            "gl": "tr",
-            "hl": "tr",
-            "num": num_results,
-        }
 
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
-            data = response.json()
         except Exception as exc:
             last_error = exc
             continue
 
+        try:
+            data = response.json()
+        except Exception:
+            data = {}
+
         if response.status_code >= 400:
-            message = f"Serper error for key #{index + 1}: HTTP {response.status_code}"
-            if response.status_code in {401, 403, 429}:
+            details = str(data)[:300] if data else response.text[:300]
+            message = f"Serper error for key #{index + 1}: HTTP {response.status_code} | {details}"
+            if response.status_code in {400, 401, 403, 429}:
                 last_error = RuntimeError(message)
                 continue
             raise RuntimeError(message)
@@ -275,6 +304,7 @@ def search_google(query: str, num_results: int, api_keys: List[str]) -> Tuple[Li
                 continue
             seen.add(link)
             links.append(link)
+
         return links, index
 
     raise RuntimeError(f"All Serper API keys failed. Last error: {last_error}")
@@ -331,20 +361,25 @@ def find_entry_nodes(soup: BeautifulSoup):
 def extract_entries(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     seen_ids = set()
+
     for node in find_entry_nodes(soup):
         content_tag = node.select_one(".content") or node.select_one("div.content") or node.find("div", class_="content")
         if not content_tag:
             continue
+
         content = content_tag.get_text(" ", strip=True)
         if not content:
             continue
+
         node_id = (node.get("data-id") or node.get("id") or "").strip()
         if node_id and node_id in seen_ids:
             continue
         if node_id:
             seen_ids.add(node_id)
+
         author_tag = node.select_one(".entry-author") or node.find("a", class_="entry-author") or node.find("span", class_="entry-author")
         date_tag = node.select_one(".entry-date") or node.find("a", class_="entry-date") or node.find("span", class_="entry-date") or node.find("time")
+
         results.append(
             {
                 "entry_id": node_id,
@@ -366,6 +401,7 @@ def convert_entries_to_raw_posts(
     collected_at_iso: str,
 ) -> List[Dict[str, Any]]:
     raw_posts: List[Dict[str, Any]] = []
+
     for entry in entries:
         text = str(entry.get("content", "")).strip()
         if not text:
@@ -398,9 +434,78 @@ def convert_entries_to_raw_posts(
                 },
                 "category": category,
                 "topic_url": base_url,
+                "page": page,
+                "author": str(entry.get("author", "")).strip(),
+                "level": level,
             }
         )
+
     return raw_posts
+
+
+def convert_post_for_mongo(post: Dict[str, Any]) -> Dict[str, Any]:
+    created_at_obj = post.get("created_at", {})
+    collected_at_obj = post.get("collected_at", {})
+
+    created_at_iso = created_at_obj.get("$date") if isinstance(created_at_obj, dict) else created_at_obj
+    collected_at_iso = collected_at_obj.get("$date") if isinstance(collected_at_obj, dict) else collected_at_obj
+
+    return {
+        "post_id": post.get("post_id"),
+        "text": post.get("text", ""),
+        "created_at": iso_to_datetime(created_at_iso),
+        "collected_at": iso_to_datetime(collected_at_iso),
+        "source": post.get("source", DEFAULT_SOURCE),
+        "language": post.get("language", DEFAULT_LANGUAGE),
+        "post_tags": post.get("post_tags", []),
+        "location": post.get("location", {}),
+        "category": post.get("category"),
+        "topic_url": post.get("topic_url"),
+        "page": post.get("page"),
+        "author": post.get("author", ""),
+        "level": post.get("level"),
+    }
+
+
+def insert_raw_posts_to_mongo(db: Any, raw_posts: List[Dict[str, Any]], collection_name: str = DEFAULT_RAW_COLLECTION) -> Dict[str, int]:
+    """Insert or update scraped posts in one MongoDB collection only."""
+    if db is None or not raw_posts:
+        return {"inserted_or_updated": 0, "errors": 0}
+
+    collection = db[collection_name]
+
+    try:
+        collection.create_index("post_id", unique=True)
+    except Exception as exc:
+        logger.warning("MongoDB index creation failed for %s: %s", collection_name, exc)
+
+    operations = []
+    for post in raw_posts:
+        try:
+            mongo_doc = convert_post_for_mongo(post)
+            if not mongo_doc.get("post_id"):
+                continue
+            operations.append(
+                UpdateOne(
+                    {"post_id": mongo_doc["post_id"]},
+                    {"$set": mongo_doc},
+                    upsert=True,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Skipped invalid post during MongoDB conversion: %s", exc)
+
+    if not operations:
+        return {"inserted_or_updated": 0, "errors": 0}
+
+    try:
+        result = collection.bulk_write(operations, ordered=False)
+        changed = int(result.upserted_count) + int(result.modified_count)
+        logger.info("MongoDB saved %s post(s) into collection '%s'", changed, collection_name)
+        return {"inserted_or_updated": changed, "errors": 0}
+    except Exception as exc:
+        logger.error("MongoDB bulk write failed for collection '%s': %s", collection_name, exc)
+        return {"inserted_or_updated": 0, "errors": len(operations)}
 
 
 def get_output_path(output_dir: Path, level: str, province: str, district: Optional[str], category: str) -> Path:
@@ -438,11 +543,14 @@ def collect_unique_posts_from_files(file_paths: List[Path]) -> List[Dict[str, An
     return combined
 
 
-def export_raw_posts(output_dir: Path, raw_posts_by_bucket: Dict[Tuple[str, str, Optional[str], str], List[Dict[str, Any]]]) -> List[Path]:
+def export_raw_posts(output_dir: Path, raw_posts_by_bucket: Dict[Tuple[str, str, Optional[str], str], List[Dict[str, Any]]]) -> Tuple[List[Path], List[Dict[str, Any]]]:
     written_paths: List[Path] = []
+    all_written_posts: List[Dict[str, Any]] = []
+
     for (level, province, district, category), raw_posts in raw_posts_by_bucket.items():
         output_path = get_output_path(output_dir, level, province, district, category)
         existing: List[Dict[str, Any]] = []
+
         if output_path.exists() and output_path.stat().st_size > 0:
             try:
                 with output_path.open("r", encoding="utf-8") as f:
@@ -450,11 +558,18 @@ def export_raw_posts(output_dir: Path, raw_posts_by_bucket: Dict[Tuple[str, str,
             except Exception:
                 existing = []
 
-        existing_ids = {item.get("post_id") for item in existing if isinstance(item, dict) and item.get("post_id")}
+        existing_ids = {
+            item.get("post_id")
+            for item in existing
+            if isinstance(item, dict) and item.get("post_id")
+        }
+
         new_posts = [item for item in raw_posts if item.get("post_id") not in existing_ids]
         save_json(output_path, existing + new_posts)
         written_paths.append(output_path)
-    return written_paths
+        all_written_posts.extend(new_posts)
+
+    return written_paths, all_written_posts
 
 
 def export_district_merged(output_dir: Path, province: str, district: Optional[str]) -> Optional[Path]:
@@ -534,33 +649,49 @@ def export_all_backups(output_dir: Path) -> Tuple[Path, List[Path], int]:
     return combined_output_file, province_combined_paths, len(combined)
 
 
-def scrape_topic_single_page(
-    scraper: cloudscraper.CloudScraper,
+def scrape_topic_pages(
     base_url: str,
-    start_page: int,
     visited_pages: set,
     visited_pages_file: Path,
-) -> Tuple[str, List[Dict[str, Any]]]:
+    visited_pages_lock: threading.Lock,
+) -> Tuple[str, List[Dict[str, Any]], List[int]]:
+    scraper = create_scraper()
     all_entries: List[Dict[str, Any]] = []
-    target_url = paged_url(base_url, start_page)
+    scraped_pages: List[int] = []
+    title = ""
 
-    if target_url in visited_pages:
-        return "", []
+    for page in range(1, MAX_PAGES_PER_TOPIC + 1):
+        target_url = paged_url(base_url, page)
 
-    html = fetch_url(scraper, target_url)
-    if not html:
-        return "", []
+        with visited_pages_lock:
+            if target_url in visited_pages:
+                continue
 
-    soup = BeautifulSoup(html, "html.parser")
-    title = extract_title(soup)
-    entries = extract_entries(soup)
-    for entry in entries:
-        entry["page"] = start_page
-        all_entries.append(entry)
+        html = fetch_url(scraper, target_url)
+        if not html:
+            continue
 
-    visited_pages.add(target_url)
-    save_set_to_csv(visited_pages, visited_pages_file, "url")
-    return title, all_entries
+        soup = BeautifulSoup(html, "html.parser")
+        if not title:
+            title = extract_title(soup)
+
+        entries = extract_entries(soup)
+        if not entries:
+            continue
+
+        for entry in entries:
+            entry["page"] = page
+            all_entries.append(entry)
+
+        scraped_pages.append(page)
+
+        with visited_pages_lock:
+            visited_pages.add(target_url)
+            save_set_to_csv(visited_pages, visited_pages_file, "url")
+
+        time.sleep(0.4)
+
+    return title, all_entries, scraped_pages
 
 
 def generate_tasks(base_dir: Path, include_province_level: bool = False) -> List[Dict[str, Any]]:
@@ -613,19 +744,23 @@ def input_to_tasks(input_data: Any) -> Optional[List[Dict[str, Any]]]:
         raw_requests = input_data.get("requests")
         if not isinstance(raw_requests, list):
             raise ValueError("input_data['requests'] must be a list")
+
         tasks: List[Dict[str, Any]] = []
         for item in raw_requests:
             if not isinstance(item, dict):
                 raise ValueError("Each request must be a dictionary")
+
             level = str(item.get("level", "district")).strip().lower() or "district"
             province = str(item.get("province", "")).strip()
             district = item.get("district")
             district = str(district).strip() if district not in (None, "", "None") else None
             category = str(item.get("category", "")).strip()
+
             if not province or not category:
                 raise ValueError("Each request must include province and category")
             if level == "district" and not district:
                 raise ValueError("District-level request must include district")
+
             tasks.append(
                 {
                     "level": level,
@@ -643,10 +778,12 @@ def input_to_tasks(input_data: Any) -> Optional[List[Dict[str, Any]]]:
         district = input_data.get("district")
         district = str(district).strip() if district not in (None, "", "None") else None
         category = str(input_data.get("category", "")).strip()
+
         if not province or not category:
             raise ValueError("input_data must include province and category when using direct parameter mode")
         if level == "district" and not district:
             raise ValueError("District-level parameter mode must include district")
+
         return [
             {
                 "level": level,
@@ -660,8 +797,93 @@ def input_to_tasks(input_data: Any) -> Optional[List[Dict[str, Any]]]:
     return None
 
 
+def build_direct_input_from_args(args) -> Dict[str, Any]:
+    if not args.province and not args.category and not args.district:
+        return {}
+
+    if not args.province or not args.category:
+        raise SystemExit("When using direct CLI arguments, --province and --category are required.")
+    if args.level == "district" and not args.district:
+        raise SystemExit("When level is district, --district is required.")
+
+    result = {
+        "level": args.level,
+        "province": args.province,
+        "district": args.district,
+        "category": args.category,
+    }
+
+    if args.num_results is not None:
+        result["num_results"] = args.num_results
+    if args.max_topics is not None:
+        result["max_topics"] = args.max_topics
+    if args.include_province_level:
+        result["include_province_level"] = True
+
+    return result
+
+
+def parse_pipeline_input(input_data: Any) -> Any:
+    """Accept dict input, JSON string input, Python dict string input, or loose pipeline strings."""
+    if not isinstance(input_data, str):
+        return input_data
+
+    raw_input = input_data.strip()
+    if not raw_input:
+        return {}
+
+    try:
+        return json.loads(raw_input)
+    except Exception:
+        pass
+
+    try:
+        import ast
+        return ast.literal_eval(raw_input)
+    except Exception:
+        pass
+
+    cleaned = raw_input.strip()
+    if cleaned.startswith("{") and cleaned.endswith("}"):
+        cleaned = cleaned[1:-1]
+
+    parsed: Dict[str, Any] = {}
+    for part in cleaned.split(","):
+        if ":" not in part:
+            continue
+
+        key, value = part.split(":", 1)
+        key = key.strip().strip('"').strip("'")
+        value = value.strip().strip('"').strip("'")
+
+        if not key:
+            continue
+
+        lowered = value.lower()
+        if lowered == "true":
+            parsed[key] = True
+        elif lowered == "false":
+            parsed[key] = False
+        elif lowered in {"none", "null"}:
+            parsed[key] = None
+        else:
+            try:
+                parsed[key] = int(value)
+            except ValueError:
+                parsed[key] = value
+
+    if parsed:
+        return parsed
+
+    raise ValueError(f"Invalid input passed to fetch step: {raw_input}")
+
+
 def run(input_data: Any, context: Dict[str, Any]) -> Any:
+    input_data = parse_pipeline_input(input_data)
+
     base_dir = Path(context.get("base_dir") or ".")
+    db = context.get("db")
+
     output_dir = base_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -680,9 +902,14 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
         max_topics = input_data.get("max_topics")
 
     explicit_tasks = input_to_tasks(input_data)
-
     api_keys = load_api_keys(base_dir)
-    scraper = create_scraper()
+
+    if explicit_tasks is None and not ALLOW_AUTOMATIC_FETCH:
+        raise ValueError(
+            "Fetch stopped because no valid input was provided. "
+            "Use --input with province, district, category, num_results, and max_topics. "
+            "This safety guard prevents accidental full-project API usage."
+        )
 
     all_tasks = explicit_tasks if explicit_tasks is not None else generate_tasks(
         base_dir, include_province_level=include_province_level
@@ -693,6 +920,9 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
     completed_topics = load_csv_column_set(completed_topics_file, "key")
     completed_requests = load_csv_column_set(completed_requests_file, "key")
 
+    visited_pages_lock = threading.Lock()
+    completed_topics_lock = threading.Lock()
+
     remaining_tasks: List[Dict[str, Any]] = []
     skipped_completed_requests = 0
     skipped_completed_topics = 0
@@ -700,6 +930,7 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
     for task in all_tasks:
         query = build_query(task["level"], task["province"], task["district"], task["category"])
         request_key = make_request_key(task["level"], task["province"], task["district"], task["category"])
+
         task["query"] = query
         task["fetch_key"] = make_fetch_key(task["level"], task["province"], task["district"], task["category"])
         task["request_key"] = request_key
@@ -719,13 +950,17 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
     total_new_posts = 0
     total_urls_found = 0
     used_key_indexes = set()
+    mongo_upserted_count = 0
+
     written_paths: List[str] = []
     merged_paths: List[str] = []
 
     grouped_topics: Dict[Tuple[str, str], List[Tuple[str, int, str, str, Optional[str], str, str]]] = defaultdict(list)
 
     for task in remaining_tasks:
+        logger.info("Searching Serper: %s", task["query"])
         links, key_index = search_google(task["query"], task["num_results"], api_keys)
+        logger.info("Found %s URL(s) for: %s", len(links), task["fetch_key"])
         used_key_indexes.add(key_index)
         total_urls_found += len(links)
         fetched_topics += 1
@@ -741,9 +976,11 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
             raw_url = str(raw_url).strip()
             if not raw_url:
                 continue
+
             base_url = normalize_topic_url(raw_url)
             start_page = extract_start_page(raw_url)
             completed_key = make_completed_key(base_url, task["level"], task["province"], task["district"], task["category"])
+
             if completed_key in completed_topics:
                 skipped_completed_topics += 1
                 continue
@@ -778,46 +1015,65 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
         def _fetch_one(item: Tuple[str, int, str, str, Optional[str], str, str]):
             base_url, start_page, level, prov, dist, category, request_key = item
             completed_key = make_completed_key(base_url, level, prov, dist, category)
-            if completed_key in completed_topics:
-                return None
-            _, entries = scrape_topic_single_page(scraper, base_url, start_page, visited_pages, visited_pages_file)
-            return base_url, level, prov, dist, category, entries, completed_key, request_key
+
+            with completed_topics_lock:
+                if completed_key in completed_topics:
+                    return None
+
+            _, entries, scraped_pages = scrape_topic_pages(
+                base_url=base_url,
+                visited_pages=visited_pages,
+                visited_pages_file=visited_pages_file,
+                visited_pages_lock=visited_pages_lock,
+            )
+
+            return base_url, level, prov, dist, category, entries, completed_key, request_key, scraped_pages
 
         with ThreadPoolExecutor(max_workers=PARALLEL_FETCH_WORKERS) as executor:
             futures = [executor.submit(_fetch_one, item) for item in group_items]
+
             for future in as_completed(futures):
                 result = future.result()
                 if result is None:
                     continue
 
-                base_url, level, prov, dist, category, entries, completed_key, request_key = result
-                completed_topics.add(completed_key)
-                save_set_to_csv(completed_topics, completed_topics_file, "key")
+                base_url, level, prov, dist, category, entries, completed_key, request_key, scraped_pages = result
 
-                collected_at_iso = utc_now_iso()
+                with completed_topics_lock:
+                    completed_topics.add(completed_key)
+                    save_set_to_csv(completed_topics, completed_topics_file, "key")
+
                 if entries:
+                    collected_at_iso = utc_now_iso()
                     raw_posts = convert_entries_to_raw_posts(base_url, level, prov, dist, category, entries, collected_at_iso)
                     total_new_posts += len(raw_posts)
                     processed_topics += 1
                     bucket = (level, prov, dist, category)
                     raw_posts_by_bucket[bucket].extend(raw_posts)
-
-                request_success[request_key] = True
+                    request_success[request_key] = True
+                elif scraped_pages:
+                    request_success[request_key] = True
 
         if raw_posts_by_bucket:
-            paths = export_raw_posts(output_dir, raw_posts_by_bucket)
+            paths, all_written_posts = export_raw_posts(output_dir, raw_posts_by_bucket)
             written_paths.extend([str(p) for p in paths])
+
+            mongo_result = insert_raw_posts_to_mongo(db, all_written_posts, collection_name=DEFAULT_RAW_COLLECTION)
+            mongo_upserted_count += mongo_result.get("inserted_or_updated", 0)
+
             merged = export_district_merged(output_dir, province, district_str or None)
             if merged:
                 merged_paths.append(str(merged))
 
-    for request_key in request_success.keys():
-        completed_requests.add(request_key)
+    for request_key, success in request_success.items():
+        if success or request_key not in completed_requests:
+            completed_requests.add(request_key)
+
     save_set_to_csv(completed_requests, completed_requests_file, "key")
 
     combined_output_file, province_combined_paths, combined_post_count = export_all_backups(output_dir)
 
-    return {
+    result_payload = {
         "step": STEP_NAME,
         "status": "ok",
         "mode": mode,
@@ -827,6 +1083,7 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
         "province_combined_files": [str(p) for p in province_combined_paths],
         "district_merged_files": merged_paths,
         "written_category_files": written_paths,
+        "mongo_collection": DEFAULT_RAW_COLLECTION,
         "total_generated_tasks": len(all_tasks),
         "run_task_count": total_tasks,
         "fetched_query_count": fetched_topics,
@@ -837,35 +1094,72 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
         "new_posts_in_this_run": total_new_posts,
         "combined_post_count": combined_post_count,
         "used_api_key_count": len(used_key_indexes),
+        "mongo_upserted_count": mongo_upserted_count,
         "resume_files": {
             "visited_pages_file": str(visited_pages_file),
             "completed_topics_file": str(completed_topics_file),
             "completed_requests_file": str(completed_requests_file),
         },
     }
+
+    return result_payload
+
+
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Run fetch step in automatic or targeted mode")
-    parser.add_argument("--input", default=None, help="Optional JSON input for targeted mode")
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(description="Run fetch step directly with MongoDB support")
+    parser.add_argument("--input", default=None, help="Optional JSON input")
     parser.add_argument("--max-topics", type=int, default=None, help="Optional limit on requests to run")
     parser.add_argument("--include-province-level", action="store_true", help="Include province-level tasks in automatic mode")
+
+    parser.add_argument("--level", choices=["district", "province"], default="district", help="Task level")
+    parser.add_argument("--province", default=None, help="Province name")
+    parser.add_argument("--district", default=None, help="District name")
+    parser.add_argument("--category", default=None, help="Category name")
+    parser.add_argument("--num-results", type=int, default=None, help="Number of Serper results to request")
+
     args = parser.parse_args()
 
     demo_input = None
+
     if args.input:
+        raw = str(args.input).strip()
+        if raw.startswith("'") and raw.endswith("'"):
+            raw = raw[1:-1]
         try:
-            demo_input = json.loads(args.input)
+            demo_input = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise SystemExit(f"Invalid JSON for --input: {exc}")
+    else:
+        demo_input = build_direct_input_from_args(args)
 
     if demo_input is None:
         demo_input = {}
 
-    if args.max_topics is not None:
+    if args.max_topics is not None and isinstance(demo_input, dict):
         demo_input["max_topics"] = args.max_topics
-    if args.include_province_level:
+    if args.include_province_level and isinstance(demo_input, dict):
         demo_input["include_province_level"] = True
 
-    demo_context = {"base_dir": ".", "db": None, "mongo_client": None}
-    print(json.dumps(run(demo_input, demo_context), indent=2, ensure_ascii=False))
+    mongo_uri = os.getenv("MONGO_URI")
+    mongo_db_name = os.getenv("MONGO_DB_NAME", "COM6064")
+
+    if not mongo_uri:
+        raise SystemExit("Missing MONGO_URI in .env")
+
+    mongo_client = MongoClient(mongo_uri)
+    mongo_db = mongo_client[mongo_db_name]
+
+    try:
+        demo_context = {
+            "base_dir": ".",
+            "db": mongo_db,
+            "mongo_client": mongo_client,
+        }
+        result = run(demo_input, demo_context)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    finally:
+        mongo_client.close()
