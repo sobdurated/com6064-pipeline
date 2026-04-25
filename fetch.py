@@ -5,6 +5,7 @@ import re
 import time
 import hashlib
 import threading
+import logging
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -35,6 +36,12 @@ DEFAULT_SOURCE = "eksisozluk"
 
 # MongoDB collection used for scraped posts only
 DEFAULT_RAW_COLLECTION = "posts_raw"
+
+# Safety switch. Keep False for demos/tests so fetch never scans everything by accident.
+ALLOW_AUTOMATIC_FETCH = False
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 
 def normalize_lookup(text: str) -> str:
@@ -461,34 +468,44 @@ def convert_post_for_mongo(post: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def insert_raw_posts_to_mongo(db: Any, raw_posts: List[Dict[str, Any]], collection_name: str = DEFAULT_RAW_COLLECTION) -> Dict[str, int]:
+    """Insert or update scraped posts in one MongoDB collection only."""
     if db is None or not raw_posts:
-        return {"inserted_or_updated": 0}
+        return {"inserted_or_updated": 0, "errors": 0}
 
     collection = db[collection_name]
 
     try:
         collection.create_index("post_id", unique=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("MongoDB index creation failed for %s: %s", collection_name, exc)
 
     operations = []
     for post in raw_posts:
-        mongo_doc = convert_post_for_mongo(post)
-        operations.append(
-            UpdateOne(
-                {"post_id": mongo_doc["post_id"]},
-                {"$set": mongo_doc},
-                upsert=True,
+        try:
+            mongo_doc = convert_post_for_mongo(post)
+            if not mongo_doc.get("post_id"):
+                continue
+            operations.append(
+                UpdateOne(
+                    {"post_id": mongo_doc["post_id"]},
+                    {"$set": mongo_doc},
+                    upsert=True,
+                )
             )
-        )
+        except Exception as exc:
+            logger.warning("Skipped invalid post during MongoDB conversion: %s", exc)
 
     if not operations:
-        return {"inserted_or_updated": 0}
+        return {"inserted_or_updated": 0, "errors": 0}
 
-    result = collection.bulk_write(operations, ordered=False)
-    changed = int(result.upserted_count) + int(result.modified_count)
-    return {"inserted_or_updated": changed}
-
+    try:
+        result = collection.bulk_write(operations, ordered=False)
+        changed = int(result.upserted_count) + int(result.modified_count)
+        logger.info("MongoDB saved %s post(s) into collection '%s'", changed, collection_name)
+        return {"inserted_or_updated": changed, "errors": 0}
+    except Exception as exc:
+        logger.error("MongoDB bulk write failed for collection '%s': %s", collection_name, exc)
+        return {"inserted_or_updated": 0, "errors": len(operations)}
 
 
 def get_output_path(output_dir: Path, level: str, province: str, district: Optional[str], category: str) -> Path:
@@ -806,7 +823,64 @@ def build_direct_input_from_args(args) -> Dict[str, Any]:
     return result
 
 
+def parse_pipeline_input(input_data: Any) -> Any:
+    """Accept dict input, JSON string input, Python dict string input, or loose pipeline strings."""
+    if not isinstance(input_data, str):
+        return input_data
+
+    raw_input = input_data.strip()
+    if not raw_input:
+        return {}
+
+    try:
+        return json.loads(raw_input)
+    except Exception:
+        pass
+
+    try:
+        import ast
+        return ast.literal_eval(raw_input)
+    except Exception:
+        pass
+
+    cleaned = raw_input.strip()
+    if cleaned.startswith("{") and cleaned.endswith("}"):
+        cleaned = cleaned[1:-1]
+
+    parsed: Dict[str, Any] = {}
+    for part in cleaned.split(","):
+        if ":" not in part:
+            continue
+
+        key, value = part.split(":", 1)
+        key = key.strip().strip('"').strip("'")
+        value = value.strip().strip('"').strip("'")
+
+        if not key:
+            continue
+
+        lowered = value.lower()
+        if lowered == "true":
+            parsed[key] = True
+        elif lowered == "false":
+            parsed[key] = False
+        elif lowered in {"none", "null"}:
+            parsed[key] = None
+        else:
+            try:
+                parsed[key] = int(value)
+            except ValueError:
+                parsed[key] = value
+
+    if parsed:
+        return parsed
+
+    raise ValueError(f"Invalid input passed to fetch step: {raw_input}")
+
+
 def run(input_data: Any, context: Dict[str, Any]) -> Any:
+    input_data = parse_pipeline_input(input_data)
+
     base_dir = Path(context.get("base_dir") or ".")
     db = context.get("db")
 
@@ -829,6 +903,13 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
 
     explicit_tasks = input_to_tasks(input_data)
     api_keys = load_api_keys(base_dir)
+
+    if explicit_tasks is None and not ALLOW_AUTOMATIC_FETCH:
+        raise ValueError(
+            "Fetch stopped because no valid input was provided. "
+            "Use --input with province, district, category, num_results, and max_topics. "
+            "This safety guard prevents accidental full-project API usage."
+        )
 
     all_tasks = explicit_tasks if explicit_tasks is not None else generate_tasks(
         base_dir, include_province_level=include_province_level
@@ -877,7 +958,9 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
     grouped_topics: Dict[Tuple[str, str], List[Tuple[str, int, str, str, Optional[str], str, str]]] = defaultdict(list)
 
     for task in remaining_tasks:
+        logger.info("Searching Serper: %s", task["query"])
         links, key_index = search_google(task["query"], task["num_results"], api_keys)
+        logger.info("Found %s URL(s) for: %s", len(links), task["fetch_key"])
         used_key_indexes.add(key_index)
         total_urls_found += len(links)
         fetched_topics += 1
@@ -976,7 +1059,7 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
             written_paths.extend([str(p) for p in paths])
 
             mongo_result = insert_raw_posts_to_mongo(db, all_written_posts, collection_name=DEFAULT_RAW_COLLECTION)
-            mongo_upserted_count += mongo_result["inserted_or_updated"]
+            mongo_upserted_count += mongo_result.get("inserted_or_updated", 0)
 
             merged = export_district_merged(output_dir, province, district_str or None)
             if merged:
