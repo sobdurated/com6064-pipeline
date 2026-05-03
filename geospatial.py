@@ -3,14 +3,15 @@ geospatial.py
 -------------
 Pipeline step : geospatial
 Contract      : run(input_data, context) -> GeoJSON FeatureCollection dict
-Author        : Adel Ugur (Modified for strict geospatial boundaries)
+Author        : Adel Ugur (Final Version - Multi-Model + Schema-Corrected Lookup)
 
 Responsibilities:
-  1. Extract and tag province + district for any untagged posts in posts_processed.
-  2. Aggregate sentiment at BOTH province level and district level for map display.
-  3. Apply fallback rules for posts with missing / unmatched locations.
-  4. Compute a map-coloring score (0.0 – 1.0) per region for the frontend.
-  5. Return a GeoJSON-compatible FeatureCollection.
+  1. Extract and tag province + district for any untagged posts.
+  2. Aggregate sentiment at BOTH province level and district level.
+  3. Support multi-model nested schema (sentiment.llm & sentiment.transformer).
+  4. HOTFIX: Join with `posts_raw` via the internal `_id` to retrieve dropped category tags instantly.
+  5. Compute map-coloring scores including category-specific breakdowns for each model.
+  6. Return a GeoJSON-compatible FeatureCollection.
 """
 
 from __future__ import annotations
@@ -140,7 +141,7 @@ PROVINCE_CODES: Dict[str, str] = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2.  LOCATION EXTRACTION (Optimized with Pre-compiled Regex)
+# 2.  LOCATION EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_lookup(locations: dict) -> dict:
@@ -159,7 +160,6 @@ def _build_lookup(locations: dict) -> dict:
 LOCATION_LOOKUP = _build_lookup(TURKEY_LOCATIONS)
 SORTED_CANDIDATES = sorted(LOCATION_LOOKUP.keys(), key=len, reverse=True)
 
-# Pre-compile regex patterns for performance
 COMPILED_PATTERNS = {
     candidate: re.compile(r'(?<![a-zA-ZğüşıöçĞÜŞİÖÇ])' + re.escape(candidate) + r'(?![a-zA-ZğüşıöçĞÜŞİÖÇ])')
     for candidate in SORTED_CANDIDATES
@@ -242,29 +242,80 @@ def sentiment_label_from_score(score: float) -> str:
     return "neutral"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  GEOJSON FEATURE BUILDERS
+# 4.  GEOJSON FEATURE BUILDERS (UPDATED FOR MULTI-MODEL)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def empty_model_stats() -> Dict[str, Any]:
+    return {
+        "scores": [], 
+        "positive": 0, 
+        "neutral": 0, 
+        "negative": 0,
+        "categories": {}
+    }
+
 def empty_bucket() -> Dict[str, Any]:
-    return {"scores": [], "positive": 0, "neutral": 0, "negative": 0}
+    return {
+        "llm": empty_model_stats(),
+        "transformer": empty_model_stats()
+    }
 
-def add_post_to_bucket(bucket: Dict, label: str, score: Any) -> None:
-    label = (label or "").lower().strip()
-    if label == "positive": bucket["positive"] += 1
-    elif label == "negative": bucket["negative"] += 1
-    else: bucket["neutral"] += 1
+def _update_stats(stats: Dict, label: str, score: Any, category: str) -> None:
+    label = (label or "neutral").lower().strip()
+    category = (category or "uncategorized").lower().strip()
+    
+    # Update main totals
+    if label == "positive": stats["positive"] += 1
+    elif label == "negative": stats["negative"] += 1
+    else: stats["neutral"] += 1
+    
+    # Initialize category dictionary if it doesn't exist yet
+    if category not in stats["categories"]:
+        stats["categories"][category] = {"positive": 0, "neutral": 0, "negative": 0}
+        
+    # Update category totals
+    if label == "positive": stats["categories"][category]["positive"] += 1
+    elif label == "negative": stats["categories"][category]["negative"] += 1
+    else: stats["categories"][category]["neutral"] += 1
+    
     if isinstance(score, (int, float)):
-        bucket["scores"].append(score)
+        stats["scores"].append(score)
 
-def compute_stats(bucket: Dict) -> Dict[str, Any]:
-    pos, neu, neg = bucket["positive"], bucket["neutral"], bucket["negative"]
+def add_post_to_bucket(bucket: Dict, sentiment: Dict, category: str) -> None:
+    # Process LLM Sentiment
+    llm_sent = sentiment.get("llm", {})
+    _update_stats(bucket["llm"], llm_sent.get("label"), llm_sent.get("score"), category)
+    
+    # Process Transformer Sentiment
+    trans_sent = sentiment.get("transformer", {})
+    _update_stats(bucket["transformer"], trans_sent.get("label"), trans_sent.get("score"), category)
+
+def _compute_model_stats(stats: Dict) -> Dict[str, Any]:
+    pos, neu, neg = stats["positive"], stats["neutral"], stats["negative"]
     total = pos + neu + neg
     color = map_color_score(pos, neu, neg)
+    
+    # Format the category data for the frontend GeoJSON
+    category_breakdown = {}
+    for cat, counts in stats["categories"].items():
+        c_pos, c_neu, c_neg = counts["positive"], counts["neutral"], counts["negative"]
+        category_breakdown[cat] = {
+            "total": c_pos + c_neu + c_neg,
+            "map_color_score": map_color_score(c_pos, c_neu, c_neg)
+        }
+        
     return {
         "total_posts": total,
         "distribution": {"positive": pos, "neutral": neu, "negative": neg},
         "map_color_score": color,
         "sentiment_label": sentiment_label_from_score(color),
+        "categories": category_breakdown
+    }
+
+def compute_stats(bucket: Dict) -> Dict[str, Any]:
+    return {
+        "llm": _compute_model_stats(bucket["llm"]),
+        "transformer": _compute_model_stats(bucket["transformer"])
     }
 
 def build_feature(level: str, province: str, stats: Dict, district: str = None) -> Dict:
@@ -272,7 +323,7 @@ def build_feature(level: str, province: str, stats: Dict, district: str = None) 
         "level": level,
         "province": province,
         "province_code": PROVINCE_CODES.get(province, "TR-??"),
-        **stats,
+        "models": stats  # Nest the llm and transformer stats here
     }
     if district:
         props["district"] = district
@@ -284,7 +335,7 @@ def build_feature(level: str, province: str, stats: Dict, district: str = None) 
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  PIPELINE ENTRY POINT
+# 5.  PIPELINE ENTRY POINT 
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run(input_data: Any, context: Dict[str, Any]) -> Dict:
@@ -295,8 +346,35 @@ def run(input_data: Any, context: Dict[str, Any]) -> Dict:
     print("  [Step 1] Tagging untagged posts with province / district ...")
     tag_posts_with_location(posts_col)
 
-    print("  [Step 2] Grouping data for GeoJSON output ...")
-    cursor = posts_col.find({}, {"location": 1, "sentiment": 1})
+    print("  [Step 2] Grouping data for GeoJSON output (Multi-Model + Category logic)...")
+    
+# AMMAR'S HOTFIX: Join via _id, but extract the category from Yusuf's post_tags array
+    pipeline = [
+        {
+            "$lookup": {
+                "from": "posts_raw",
+                "localField": "post_id",
+                "foreignField": "_id",
+                "as": "raw_doc"
+            }
+        },
+        {
+            "$unwind": {
+                "path": "$raw_doc",
+                "preserveNullAndEmptyArrays": True
+            }
+        },
+        {
+            "$project": {
+                "location": 1,
+                "sentiment": 1,
+                # Grab the first element (index 0) of the post_tags array
+                "category": { "$arrayElemAt": ["$raw_doc.post_tags", 0] } 
+            }
+        }
+    ]
+    
+    cursor = posts_col.aggregate(pipeline)
 
     province_buckets: Dict[str, Dict] = defaultdict(empty_bucket)
     district_buckets: Dict[Tuple, Dict] = defaultdict(empty_bucket)
@@ -305,12 +383,13 @@ def run(input_data: Any, context: Dict[str, Any]) -> Dict:
     for post in cursor:
         loc = post.get("location") or {}
         sent = post.get("sentiment") or {}
+        cat = post.get("category", "uncategorized") 
         
         province, district = apply_fallback(loc.get("province", ""), loc.get("district", ""))
         if province == FALLBACK_PROVINCE: unknown_count += 1
 
-        add_post_to_bucket(province_buckets[province], sent.get("label", ""), sent.get("score", None))
-        add_post_to_bucket(district_buckets[(province, district)], sent.get("label", ""), sent.get("score", None))
+        add_post_to_bucket(province_buckets[province], sent, cat)
+        add_post_to_bucket(district_buckets[(province, district)], sent, cat)
 
     all_features = []
     for prov, bucket in province_buckets.items():
