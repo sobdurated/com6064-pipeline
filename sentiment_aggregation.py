@@ -5,19 +5,17 @@ from typing import Any, Dict
 
 STEP_NAME = "sentiment_aggregation"
 
-# =============================
-# SENTIMENT MAP 
-# =============================
 SENTIMENT_MAP = {
     "positive": 1,
     "negative": -1
 }
 
+MODEL_TYPES = ["llm", "transformer"]
+
 def run(input_data: Any, context: Dict[str, Any]) -> Any:
     print(f"running step: {STEP_NAME}")
 
     db = context["db"]
-
     posts_collection = db["posts_processed"]
     aggregates_collection = db["sentiment_aggregates"]
 
@@ -29,7 +27,7 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
     #policy = politika 
     #tourism = turizm 
     #economy = ekonomi 
-    #weather = hava
+    #weather = hava  
     FILTER_KEYWORD = None
     #positive/negative
     FILTER_SENTIMENT = None
@@ -42,173 +40,134 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
     }
 
     posts = list(posts_collection.find(query))
+    print(f"\nTotal posts fetched: {len(posts)}")
 
     # =============================
-    # APPLY FILTERS
+    # PROCESS EACH MODEL
     # =============================
-    filtered_posts = []
+    for model_type in MODEL_TYPES:
 
-    for post in posts:
-        text = post.get("text", "").lower()
-        sentiment_label = post.get("sentiment", {}).get("label", "").lower()
+        print(f"\n===== MODEL: {model_type.upper()} =====")
 
-        # Skip removed neutral
-        if sentiment_label not in SENTIMENT_MAP:
-            continue
+        filtered_posts = []
 
-        if FILTER_KEYWORD and FILTER_KEYWORD.lower() not in text:
-            continue
+        for post in posts:
+            text = post.get("text", "").lower()
+            sentiment_data = post.get("sentiment", {}).get(model_type, {})
+            label = sentiment_data.get("label", "").lower()
 
-        if FILTER_SENTIMENT and sentiment_label != FILTER_SENTIMENT:
-            continue
+            if label not in SENTIMENT_MAP:
+                continue
 
-        filtered_posts.append(post)
+            if FILTER_KEYWORD and FILTER_KEYWORD.lower() not in text:
+                continue
 
-    print(f"Total posts after filtering: {len(filtered_posts)}")
+            if FILTER_SENTIMENT and label != FILTER_SENTIMENT:
+                continue
 
-    # =============================
-    # GROUP BY PROVINCE
-    # =============================
-    groups = defaultdict(list)
+            filtered_posts.append(post)
 
-    for post in filtered_posts:
-        province = post.get("location", {}).get("province")
-        if province:
-            groups[province].append(post)
+        print(f"Filtered posts: {len(filtered_posts)}")
 
-    dashboard_summary = []
-    total_posts_all = 0
+        # =============================
+        # GROUP BY PROVINCE
+        # =============================
+        groups = defaultdict(list)
 
-    # =============================
-    # CALCULATE METRICS
-    # =============================
-    for province, p_list in groups.items():
+        for post in filtered_posts:
+            province = post.get("location", {}).get("province")
+            if province:
+                groups[province].append(post)
 
-        N_total = len(p_list)
-        total_posts_all += N_total
+        # =============================
+        # CALCULATE METRICS
+        # =============================
+        for province, p_list in groups.items():
 
-        sentiments = [
-            SENTIMENT_MAP[p["sentiment"]["label"].lower()]
-            for p in p_list
-        ]
+            N_total = len(p_list)
 
-        confidences = [p["sentiment"]["score"] for p in p_list]
+            sentiments = []
+            confidences = []
 
-        N_positive = sentiments.count(1)
-        N_negative = sentiments.count(-1)
+            for p in p_list:
+                s = p["sentiment"][model_type]
+                sentiments.append(SENTIMENT_MAP[s["label"].lower()])
+                confidences.append(s["score"])
 
-        pos_pct = N_positive / N_total
-        neg_pct = N_negative / N_total
+            N_positive = sentiments.count(1)
+            N_negative = sentiments.count(-1)
 
-        avg_sent = sum(sentiments) / N_total
-        polarity = (N_positive - N_negative) / N_total
+            pos_pct = N_positive / N_total
+            neg_pct = N_negative / N_total
 
-        variance = sum((s - avg_sent) ** 2 for s in sentiments) / N_total
-        volatility = math.sqrt(variance)
+            avg_sent = sum(sentiments) / N_total
+            polarity = (N_positive - N_negative) / N_total
 
-        confidence_avg = sum(confidences) / N_total
-        volume_score = N_total * abs(avg_sent)
+            variance = sum((s - avg_sent) ** 2 for s in sentiments) / N_total
+            volatility = math.sqrt(variance)
 
-        normalized_score = (avg_sent + 1) / 2
+            confidence_avg = sum(confidences) / N_total
+            volume_score = N_total * abs(avg_sent)
 
-        row = {
-            "province": province,
-            "post_count": N_total,
-            "positive_ratio": round(pos_pct, 2),
-            "negative_ratio": round(neg_pct, 2),
-            "average_sentiment": round(avg_sent, 2),
-            "normalized_score": round(normalized_score, 2)
-        }
+            normalized_score = (avg_sent + 1) / 2
 
-        dashboard_summary.append(row)
+            document = {
+                "province": province,
+                "district": "ALL",
+                "model_type": model_type,
+                "time_window": {
+                    "start": START_DATE,
+                    "end": END_DATE
+                },
+                "total_posts": N_total,
+                "average_sentiment": avg_sent,
+                "normalized_score": normalized_score,
+                "polarity": polarity,
+                "volatility": volatility,
+                "confidence": confidence_avg,
+                "volume_score": volume_score,
+                "distribution": {
+                    "positive": N_positive,
+                    "negative": N_negative
+                },
+                "ratios": {
+                    "positive": pos_pct,
+                    "negative": neg_pct
+                },
+                "last_updated": datetime.now()
+            }
 
-        print("\n--- PROVINCE RESULT ---")
-        print(row)
+            print("\n--- RESULT ---")
+            print(document)
 
-        aggregates_collection.update_one(
-            {"province": province, "district": "ALL"},
-            {
-                "$set": {
+            aggregates_collection.update_one(
+                {
                     "province": province,
                     "district": "ALL",
-                    "time_window": {
-                        "start": START_DATE,
-                        "end": END_DATE
-                    },
-                    "total_posts": N_total,
-                    "average_sentiment": avg_sent,
-                    "normalized_score": normalized_score,
-                    "polarity": polarity,
-                    "volatility": volatility,
-                    "confidence": confidence_avg,
-                    "volume_score": volume_score,
-                    "distribution": {
-                        "positive": N_positive,
-                        "negative": N_negative
-                    },
-                    "ratios": {
-                        "positive": pos_pct,
-                        "negative": neg_pct
-                    },
-                    "last_updated": datetime.now()
-                }
-            },
-            upsert=True
-        )
+                    "model_type": model_type
+                },
+                {"$set": document},
+                upsert=True
+            )
 
-    # =============================
-    # DASHBOARD 
-    # =============================
-    if dashboard_summary:
-        dashboard_cards = {
-            "type": "dashboard_cards",
-            "total_posts": total_posts_all,
-            "avg_sentiment_score": round(
-                sum(row["normalized_score"] for row in dashboard_summary) / len(dashboard_summary), 2
-            ),
-            "top_positive_province": max(
-                dashboard_summary, key=lambda x: x["normalized_score"]
-            )["province"],
-            "top_negative_province": min(
-                dashboard_summary, key=lambda x: x["normalized_score"]
-            )["province"],
-            "last_updated": datetime.now()
-        }
-    else:
-        dashboard_cards = {}
+            print(f"Updated: {province} ({model_type})")
 
-    print("\n===== DASHBOARD CARDS =====")
-    print(dashboard_cards)
+    print("\n✅ All data processed successfully!")
 
+    
     return {
         "step": STEP_NAME,
-        "total_posts": total_posts_all,
-        "provinces_processed": len(dashboard_summary),
-        "dashboard": dashboard_cards
+        "status": "completed"
     }
+
+
 # References:
-# 1. PyMongo Documentation (MongoDB Python Driver):
-#    https://pymongo.readthedocs.io/en/stable/
-
-# 2. MongoDB Atlas Documentation:
-#    https://www.mongodb.com/docs/atlas/
-
-# 3. Python Official Documentation:
-#    https://docs.python.org/3/
-
-# 4. Sentiment Analysis Theory:
-#    Pang, B., & Lee, L. (2008). Opinion Mining and Sentiment Analysis.
-#    https://www.cs.cornell.edu/home/llee/omsa/omsa.pdf
-
-# 5. Data Aggregation & Analytics Concepts:
-#    Han, J., Kamber, M., & Pei, J. (2011). Data Mining: Concepts and Techniques.
+# 1. https://pymongo.readthedocs.io/en/stable/
+# 2. https://www.mongodb.com/docs/atlas/
+# 3. https://docs.python.org/3/
 
 # Description:
-# This module is part of a multi-step data processing pipeline.
-# It uses a shared MongoDB connection provided by the pipeline context,
-# retrieves processed posts, applies filtering (date, keyword, sentiment),
-# aggregates sentiment data at the province level, and computes metrics
-# such as average sentiment, polarity, volatility, confidence score,
-# and normalized sentiment score.
-# The module generates dashboard-ready outputs and stores results in:
-# (1) sentiment_aggregates collection for province-level metrics
+# This pipeline step retrieves posts from MongoDB and aggregates
+# sentiment data per province for both llm and transformer models.
+# It applies filtering (date, keyword, sentiment), computes metrics,
+# and stores results in sentiment_aggregates using model_type.
