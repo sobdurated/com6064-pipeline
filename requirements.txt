@@ -18,3 +18,6 @@ python-dotenv
 # Preprocess step (text cleaning, emoji handling, stopwords)
 emoji
 nltk
+
+# tests
+pytest
