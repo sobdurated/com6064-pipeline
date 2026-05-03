@@ -214,7 +214,19 @@ def run(input_data: Any, context: Dict[str, Any]) -> Dict[str, Any]:
                 {"post_id": item["post_id"]},
                 {"$set": {
                     "text": item["cleaned_text"],
-                    "sentiment": {"label": "neutral", "score": 0.0, "model": "pending"},
+                    # UPDATED SCHEMA: Nested sentiment structure
+                    "sentiment": {
+                        "llm": {
+                            "label": "neutral",
+                            "score": 0.0,
+                            "model": "pending"
+                        },
+                        "transformer": {
+                            "label": "neutral",
+                            "score": 0.0,
+                            "model": "pending"
+                        }
+                    },
                     "location": item["location"], 
                     "created_at": item["created_at"],
                     "_anonymized": True, 
@@ -242,7 +254,19 @@ def run(input_data: Any, context: Dict[str, Any]) -> Dict[str, Any]:
             {"post_id": item["post_id"]},
             {"$set": {
                 "text": item["cleaned_text"],
-                "sentiment": {"label": "neutral", "score": 0.0, "model": "pending"},
+                # UPDATED SCHEMA: Nested sentiment structure
+                "sentiment": {
+                    "llm": {
+                        "label": "neutral",
+                        "score": 0.0,
+                        "model": "pending"
+                    },
+                    "transformer": {
+                        "label": "neutral",
+                        "score": 0.0,
+                        "model": "pending"
+                    }
+                },
                 "location": item["location"], 
                 "created_at": item["created_at"],
                 "_anonymized": True, 
