@@ -13,6 +13,7 @@ PIPELINE_STEPS: List[Tuple[str, str]] = [
     ("fetch", "fetch.py"), #yusuf's task
     ("preprocess", "preprocess.py"), #hamza's task
     ("sentiment", "sentiment_analysis.py"), #ammaar's task
+    ("sentiment_llm", "sentiment_analysis_llm.py"), #ammaar's task (llm-based sentiment analysis)
     ("geospatial", "geospatial.py"), #adel's task
     ("sentiment_aggregation", "sentiment_aggregation.py") #ebraheem's task
 ]
