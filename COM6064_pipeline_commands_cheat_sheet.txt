@@ -1,0 +1,326 @@
+COM6064 Pipeline Command Cheat Sheet
+====================================
+
+Use these commands from the project root folder.
+
+Example project root:
+C:\Users\HP\OneDrive\Desktop\Pull test 4\com6064-pipeline-main (2)\com6064-pipeline-main
+
+
+1. Activate virtual environment
+-------------------------------
+
+PowerShell:
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\venv\Scripts\Activate.ps1
+
+You are ready when you see:
+
+(venv) PS ...
+
+
+2. Install requirements
+-----------------------
+
+pip install -r requirements.txt
+
+
+3. Create or edit .env
+----------------------
+
+notepad .env
+
+Example .env content:
+
+MONGO_URI=mongodb+srv://<username>:<password>@cluster0.xxxxx.mongodb.net/myDatabase?appName=Cluster0
+MONGO_DB_NAME=COM6064
+SERPER_API_KEYS=key1,key2,key3
+
+
+4. Run fetch only with one province, one district, one category
+---------------------------------------------------------------
+
+$json='{"max_topics":1,"num_results":1,"province":"Ankara","district":"Nallıhan","category":"yemek"}'
+python pipeline.py --interactive --input $json
+
+Choose:
+
+2
+
+
+5. Run full pipeline with one province, one district, one category
+------------------------------------------------------------------
+
+$json='{"max_topics":1,"num_results":1,"province":"Ankara","district":"Nallıhan","category":"yemek"}'
+python pipeline.py --interactive --input $json
+
+Choose:
+
+1
+
+
+6. Run fetch only with one district and all categories
+-----------------------------------------------------
+
+$json='{"max_topics":3,"num_results":3,"province":"Ankara","district":"Ayaş","category":"all"}'
+python pipeline.py --interactive --input $json
+
+Choose:
+
+2
+
+
+7. Run full pipeline with one district and all categories
+--------------------------------------------------------
+
+$json='{"max_topics":3,"num_results":3,"province":"Ankara","district":"Ayaş","category":"all"}'
+python pipeline.py --interactive --input $json
+
+Choose:
+
+1
+
+
+8. Run one province, all districts, one category
+------------------------------------------------
+
+$json='{"max_topics":1,"num_results":1,"province":"Ankara","district":"all","category":"konaklama"}'
+python pipeline.py --interactive --input $json
+
+Choose:
+
+2 for fetch only
+1 for full pipeline
+
+
+9. Run one province, all districts, all categories
+--------------------------------------------------
+
+$json='{"max_topics":1,"num_results":1,"province":"Ankara","district":"all","category":"all"}'
+python pipeline.py --interactive --input $json
+
+Choose:
+
+2 for fetch only
+1 for full pipeline
+
+
+10. Run all provinces, all districts, one category
+--------------------------------------------------
+
+$json='{"max_topics":1,"num_results":1,"province":"all","district":"all","category":"yemek","confirm_bulk":true}'
+python pipeline.py --interactive --input $json
+
+Choose:
+
+2 for fetch only
+
+
+11. Run all provinces, all districts, all categories
+----------------------------------------------------
+
+Warning:
+This is a large run. It may need thousands of Serper API requests.
+
+$json='{"max_topics":1,"num_results":1,"province":"all","district":"all","category":"all","confirm_bulk":true}'
+python pipeline.py --interactive --input $json
+
+Choose:
+
+2 for fetch only
+
+
+12. Test redundancy
+-------------------
+
+Run the same command twice.
+
+First run:
+
+$json='{"max_topics":3,"num_results":3,"province":"Ankara","district":"Nallıhan","category":"all"}'
+python pipeline.py --interactive --input $json
+
+Choose:
+
+2
+
+Second run:
+
+python pipeline.py --interactive --input $json
+
+Choose:
+
+2
+
+Expected result:
+MongoDB should not add duplicate posts.
+The script should skip completed requests or insert 0 new posts.
+
+
+13. Get more data for the same province, district, category
+-----------------------------------------------------------
+
+Use force_refresh if your final fetch.py supports it.
+
+$json='{"max_topics":4,"num_results":4,"province":"Ankara","district":"Nallıhan","category":"all","force_refresh":true}'
+python pipeline.py --interactive --input $json
+
+Choose:
+
+2
+
+Expected result:
+The script searches again.
+MongoDB still prevents duplicate posts using post_id.
+Only new clean posts should be saved.
+
+
+14. Meaning of max_topics and num_results
+-----------------------------------------
+
+num_results:
+How many search result URLs Serper should return.
+
+max_topics:
+How many of those URLs the scraper should actually scrape.
+
+Example:
+
+"num_results":3
+"max_topics":3
+
+Meaning:
+1 Serper API call.
+Up to 3 URLs returned.
+Up to 3 topic URLs scraped.
+Each topic can scrape up to 5 pages.
+
+
+15. API usage estimate
+----------------------
+
+1 search query = 1 Serper API request.
+
+One province + one district + one category = 1 search query.
+
+Example:
+
+Ankara + Nallıhan + yemek = 1 API request
+
+If you use:
+districts × categories
+
+Example:
+973 districts × 5 categories = about 4,865 API requests.
+
+
+16. Useful Ankara test districts
+--------------------------------
+
+Nallıhan
+Ayaş
+Kızılcahamam
+Çubuk
+Güdül
+Çamlıdere
+Kalecik
+Elmadağ
+Evren
+Şereflikoçhisar
+
+
+17. Useful categories
+---------------------
+
+yemek
+konaklama
+yerler
+ulaşım
+insanlar
+all
+
+
+18. Check MongoDB records
+-------------------------
+
+In MongoDB Atlas filter:
+
+{
+  "location.province": "Ankara",
+  "location.district": "Nallıhan"
+}
+
+For category:
+
+{
+  "location.province": "Ankara",
+  "location.district": "Nallıhan",
+  "category": "yemek"
+}
+
+For tags:
+
+{
+  "post_tags": {
+    "$all": ["Ankara", "Nallıhan", "yemek"]
+  }
+}
+
+
+19. Local output folders
+------------------------
+
+Expected local output structure:
+
+output/raw
+output/clean
+output/invalid
+output/logs
+output/reports
+
+MongoDB should store only clean valid posts in:
+
+posts_raw
+
+
+20. Success signs
+-----------------
+
+Fetch success:
+
+INFO: Searching Serper
+INFO: Found URL(s)
+INFO: Topic saved immediately
+INFO: MongoDB saved posts into collection 'posts_raw'
+
+Full pipeline success:
+
+pipeline finished: executed contracts 5/5
+steps summary: attempted=5 | executed=5
+
+
+21. Common errors
+-----------------
+
+Error:
+ModuleNotFoundError
+
+Fix:
+pip install -r requirements.txt
+
+Error:
+Activate.ps1 cannot be loaded
+
+Fix:
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\venv\Scripts\Activate.ps1
+
+Error:
+JSON input broken in PowerShell
+
+Fix:
+Use variable format:
+
+$json='{"max_topics":1,"num_results":1,"province":"Ankara","district":"Nallıhan","category":"yemek"}'
+python pipeline.py --interactive --input $json
