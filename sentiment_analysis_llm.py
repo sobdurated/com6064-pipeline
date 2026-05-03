@@ -1,27 +1,70 @@
 import gc
 import csv
 import os
+import re
 from typing import Any, Dict, Iterable, List, Tuple
 
 import torch
 from pymongo import UpdateOne
-from transformers import pipeline
-
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 SOURCE_COLLECTION = os.getenv("MONGO_SOURCE_COLLECTION", "posts_processed")
-MODEL_NAME = "savasy/bert-base-turkish-sentiment-cased"
-BATCH_SIZE = int(os.getenv("SENTIMENT_BATCH_SIZE", "16"))
-MAX_TEXT_LEN = int(os.getenv("SENTIMENT_MAX_TEXT_LEN", "512"))
+MODEL_NAME = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
+BATCH_SIZE = int(os.getenv("SENTIMENT_BATCH_SIZE", "8"))
+MAX_TEXT_LEN = int(os.getenv("SENTIMENT_MAX_TEXT_LEN", "400"))
+MAX_NEW_TOKENS = 8
+
+SYSTEM_PROMPT = (
+    "You are a sentiment classification assistant. "
+    "Classify the sentiment of the given text.\n\n"
+    "Rules:\n"
+    "- Reply with ONLY one word: positive OR negative\n"
+    "- No punctuation, no explanation, no other words\n"
+    "- If the text is ambiguous, pick the closest match\n"
+    "- Respond in English regardless of the input language"
+)
 
 
-def _normalize_label(raw_label: str, score: float) -> str:
-    label = (raw_label or "").strip().lower()
-    if "negative" in label or label == "label_0":
-        return "negative"
-    if "positive" in label or label == "label_1":
-        return "positive"
+def _build_prompt(tokenizer, text: str) -> str:
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Text: {text}"},
+    ]
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
 
-    return "positive" if score >= 0.5 else "negative"
+
+def _normalize_label(raw_text: str, fallback_score: float = 0.0) -> Tuple[str, float]:
+    cleaned = raw_text.strip().lower()
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL).strip()
+    first_word = cleaned.split()[0] if cleaned.split() else ""
+
+    if "negative" in first_word:
+        return "negative", 0.90
+    if "positive" in first_word:
+        return "positive", 0.90
+
+    if "negative" in cleaned:
+        return "negative", 0.75
+    if "positive" in cleaned:
+        return "positive", 0.75
+
+    return ("positive" if fallback_score >= 0.5 else "negative"), 0.50
+
+
+def _build_sentiment_pipeline():
+    print(f"loading model: {MODEL_NAME}")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        device_map="auto",
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+    )
+    model.eval()
+    print(f"model loaded | device map: {model.hf_device_map}")
+    return tokenizer, model
 
 
 def _chunked(records: List[Dict], size: int) -> Iterable[List[Dict]]:
@@ -29,43 +72,58 @@ def _chunked(records: List[Dict], size: int) -> Iterable[List[Dict]]:
         yield records[idx : idx + size]
 
 
+def _infer_batch(tokenizer, model, texts: List[str]) -> List[Tuple[str, float]]:
+    prompts = [_build_prompt(tokenizer, text) for text in texts]
+
+    inputs = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=512,
+    ).to(model.device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+            temperature=None,
+            top_p=None,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+    results = []
+    input_len = inputs["input_ids"].shape[1]
+    for output_ids in outputs:
+        new_tokens = output_ids[input_len:]
+        raw_text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+        label, score = _normalize_label(raw_text)
+        results.append((label, score))
+
+    return results
+
+
 def _load_posts_for_inference(collection) -> List[Dict]:
     query = {
         "text": {"$type": "string", "$ne": ""},
         "$or": [
-            {"sentiment.transformer.model": "pending"},
-            {"sentiment.transformer.label": "neutral"},
+            {"sentiment.llm.model": "pending"},
+            {"sentiment.llm.label": "neutral"},
         ],
     }
     projection = {"_id": 1, "text": 1}
     return list(collection.find(query, projection))
 
 
-def _build_sentiment_pipeline():
-    device = 0 if torch.cuda.is_available() else -1
-    print(f"loading model: {MODEL_NAME}")
-    return pipeline(
-        task="text-classification",
-        model=MODEL_NAME,
-        tokenizer=MODEL_NAME,
-        truncation=True,
-        max_length=MAX_TEXT_LEN,
-        device=device,
-    )
-
-
 def _resolve_dataset_path(dataset_path: str, context: Dict[str, Any]) -> str:
     raw_path = (dataset_path or "").strip()
     if not raw_path:
         raise ValueError("evaluation.dataset_path must be provided")
-
     if os.path.isabs(raw_path):
         return raw_path
-
     base_dir = str(context.get("base_dir") or "")
-    if not base_dir:
-        return raw_path
-    return os.path.join(base_dir, raw_path)
+    return os.path.join(base_dir, raw_path) if base_dir else raw_path
 
 
 def _load_labeled_samples(csv_path: str, text_column: str, label_column: str, id_column: str) -> List[Dict[str, str]]:
@@ -74,7 +132,6 @@ def _load_labeled_samples(csv_path: str, text_column: str, label_column: str, id
         reader = csv.DictReader(handle)
         if reader.fieldnames is None:
             raise ValueError("evaluation CSV has no header row")
-
         if text_column not in reader.fieldnames:
             raise ValueError(f"missing text column '{text_column}' in evaluation CSV")
         if label_column not in reader.fieldnames:
@@ -83,95 +140,58 @@ def _load_labeled_samples(csv_path: str, text_column: str, label_column: str, id
         for row in reader:
             text = str(row.get(text_column, "") or "").strip()
             raw_label = str(row.get(label_column, "") or "").strip().lower()
-            normalized_true = _normalize_label(raw_label, 0.0)
+            normalized_true, _ = _normalize_label(raw_label)
 
-            if not text:
+            if not text or normalized_true not in {"positive", "negative"}:
                 continue
 
-            if normalized_true not in {"positive", "negative"}:
-                continue
-
-            samples.append(
-                {
-                    "entry_id": str(row.get(id_column, "") or ""),
-                    "text": text,
-                    "true_label": normalized_true,
-                }
-            )
-
+            samples.append({"entry_id": str(row.get(id_column, "") or ""), "text": text, "true_label": normalized_true})
     return samples
 
 
-def _safe_ratio(numerator: int, denominator: int) -> float:
-    if denominator == 0:
-        return 0.0
-    return numerator / denominator
+def _safe_ratio(n: int, d: int) -> float:
+    return 0.0 if d == 0 else n / d
 
 
 def _compute_metrics(true_labels: List[str], pred_labels: List[str]) -> Dict[str, Any]:
     tp = tn = fp = fn = 0
-
-    for true_label, pred_label in zip(true_labels, pred_labels):
-        if true_label == "positive" and pred_label == "positive":
+    for t, p in zip(true_labels, pred_labels):
+        if t == "positive" and p == "positive":
             tp += 1
-        elif true_label == "negative" and pred_label == "negative":
+        elif t == "negative" and p == "negative":
             tn += 1
-        elif true_label == "negative" and pred_label == "positive":
+        elif t == "negative" and p == "positive":
             fp += 1
-        elif true_label == "positive" and pred_label == "negative":
+        elif t == "positive" and p == "negative":
             fn += 1
 
     total = len(true_labels)
     accuracy = _safe_ratio(tp + tn, total)
-
     precision_pos = _safe_ratio(tp, tp + fp)
     recall_pos = _safe_ratio(tp, tp + fn)
     f1_pos = _safe_ratio(2 * precision_pos * recall_pos, precision_pos + recall_pos)
-
     precision_neg = _safe_ratio(tn, tn + fn)
     recall_neg = _safe_ratio(tn, tn + fp)
     f1_neg = _safe_ratio(2 * precision_neg * recall_neg, precision_neg + recall_neg)
 
-    macro_precision = (precision_pos + precision_neg) / 2
-    macro_recall = (recall_pos + recall_neg) / 2
-    macro_f1 = (f1_pos + f1_neg) / 2
-
     return {
         "support": total,
         "accuracy": accuracy,
-        "confusion_matrix": {
-            "true_negative": tn,
-            "false_positive": fp,
-            "false_negative": fn,
-            "true_positive": tp,
-        },
+        "confusion_matrix": {"true_negative": tn, "false_positive": fp, "false_negative": fn, "true_positive": tp},
         "per_class": {
-            "positive": {
-                "precision": precision_pos,
-                "recall": recall_pos,
-                "f1": f1_pos,
-                "support": tp + fn,
-            },
-            "negative": {
-                "precision": precision_neg,
-                "recall": recall_neg,
-                "f1": f1_neg,
-                "support": tn + fp,
-            },
+            "positive": {"precision": precision_pos, "recall": recall_pos, "f1": f1_pos, "support": tp + fn},
+            "negative": {"precision": precision_neg, "recall": recall_neg, "f1": f1_neg, "support": tn + fp},
         },
         "macro_avg": {
-            "precision": macro_precision,
-            "recall": macro_recall,
-            "f1": macro_f1,
+            "precision": (precision_pos + precision_neg) / 2,
+            "recall": (recall_pos + recall_neg) / 2,
+            "f1": (f1_pos + f1_neg) / 2,
         },
     }
 
 
 def run_sentiment_evaluation(context: Dict[str, Any], evaluation_config: Dict[str, Any]) -> Dict[str, Any]:
-    dataset_path = _resolve_dataset_path(
-        dataset_path=str(evaluation_config.get("dataset_path", "")),
-        context=context,
-    )
+    dataset_path = _resolve_dataset_path(str(evaluation_config.get("dataset_path", "")), context)
     text_column = str(evaluation_config.get("text_column", "content"))
     label_column = str(evaluation_config.get("label_column", "label"))
     id_column = str(evaluation_config.get("id_column", "entry_id"))
@@ -192,68 +212,45 @@ def run_sentiment_evaluation(context: Dict[str, Any], evaluation_config: Dict[st
             "dataset_path": dataset_path,
             "total_samples": 0,
             "metrics": {},
-            "error_analysis": {
-                "total_misclassified": 0,
-                "misclassified_examples": [],
-                "hardest_errors": [],
-            },
+            "error_analysis": {"total_misclassified": 0, "misclassified_examples": [], "hardest_errors": []},
         }
 
     print(f"evaluation samples: {len(samples)}")
-    sentiment_pipe = _build_sentiment_pipeline()
+    tokenizer, model = _build_sentiment_pipeline()
 
     results: List[Dict[str, Any]] = []
-    for sample_batch in _chunked(samples, batch_size):
-        texts = [item["text"][:MAX_TEXT_LEN] for item in sample_batch]
-        predictions = sentiment_pipe(texts)
+    for batch in _chunked(samples, batch_size):
+        texts = [item["text"][:MAX_TEXT_LEN] for item in batch]
+        predictions = _infer_batch(tokenizer, model, texts)
 
-        for item, pred in zip(sample_batch, predictions):
-            raw_label = str(pred.get("label", ""))
-            score = float(pred.get("score", 0.0))
-            predicted_label = _normalize_label(raw_label, score)
+        for item, (pred_label, score) in zip(batch, predictions):
             results.append(
                 {
                     "entry_id": item["entry_id"],
                     "text": item["text"],
                     "true_label": item["true_label"],
-                    "predicted_label": predicted_label,
+                    "predicted_label": pred_label,
                     "score": score,
-                    "is_error": item["true_label"] != predicted_label,
+                    "is_error": item["true_label"] != pred_label,
                 }
             )
 
-    true_labels = [item["true_label"] for item in results]
-    pred_labels = [item["predicted_label"] for item in results]
-    metrics = _compute_metrics(true_labels=true_labels, pred_labels=pred_labels)
+    true_labels = [r["true_label"] for r in results]
+    pred_labels = [r["predicted_label"] for r in results]
+    metrics = _compute_metrics(true_labels, pred_labels)
 
-    misclassified = [item for item in results if item["is_error"]]
-    misclassified_sorted = sorted(misclassified, key=lambda item: item["score"], reverse=True)
+    misclassified = [r for r in results if r["is_error"]]
+    misclassified_sorted = sorted(misclassified, key=lambda r: r["score"], reverse=True)
 
-    error_examples = [
-        {
-            "entry_id": item["entry_id"],
-            "true_label": item["true_label"],
-            "predicted_label": item["predicted_label"],
-            "score": item["score"],
-            "text": item["text"][:240],
-        }
-        for item in misclassified[:error_limit]
-    ]
-
-    hardest_errors = [
-        {
-            "entry_id": item["entry_id"],
-            "true_label": item["true_label"],
-            "predicted_label": item["predicted_label"],
-            "score": item["score"],
-            "text": item["text"][:240],
-        }
-        for item in misclassified_sorted[:error_limit]
-    ]
+    def _trim(items, limit):
+        return [
+            {"entry_id": r["entry_id"], "true_label": r["true_label"],
+             "predicted_label": r["predicted_label"], "score": r["score"], "text": r["text"][:240]}
+            for r in items[:limit]
+        ]
 
     print(
-        "evaluation summary "
-        f"| samples={metrics.get('support', 0)} "
+        f"evaluation summary | samples={metrics.get('support', 0)} "
         f"| accuracy={metrics.get('accuracy', 0.0):.4f} "
         f"| errors={len(misclassified)}"
     )
@@ -271,8 +268,8 @@ def run_sentiment_evaluation(context: Dict[str, Any], evaluation_config: Dict[st
         "metrics": metrics,
         "error_analysis": {
             "total_misclassified": len(misclassified),
-            "misclassified_examples": error_examples,
-            "hardest_errors": hardest_errors,
+            "misclassified_examples": _trim(misclassified, error_limit),
+            "hardest_errors": _trim(misclassified_sorted, error_limit),
         },
     }
 
@@ -282,7 +279,7 @@ def run_sentiment_pipeline(context: Dict[str, Any]) -> Tuple[int, int]:
     collection = db[SOURCE_COLLECTION]
 
     print(f"database: {db.name} | collection: {SOURCE_COLLECTION}")
-    sentiment_pipe = _build_sentiment_pipeline()
+    tokenizer, model = _build_sentiment_pipeline()
 
     posts = _load_posts_for_inference(collection)
     total_posts = len(posts)
@@ -296,22 +293,20 @@ def run_sentiment_pipeline(context: Dict[str, Any]) -> Tuple[int, int]:
     ops: List[UpdateOne] = []
     for post_batch in _chunked(posts, BATCH_SIZE):
         texts = [doc["text"][:MAX_TEXT_LEN] for doc in post_batch]
-        predictions = sentiment_pipe(texts)
+        predictions = _infer_batch(tokenizer, model, texts)
 
-        for doc, pred in zip(post_batch, predictions):
-            raw_label = pred.get("label", "")
-            score = float(pred.get("score", 0.0))
-            sentiment_label = _normalize_label(raw_label, score)
-            print(f"-------------\npost_id: {doc['_id']}\npost content: {doc['text']}\nscore: {score:.4f}\nlabel: {sentiment_label}\n")
-
+        for doc, (sentiment_label, score) in zip(post_batch, predictions):
+            print(
+                f"-------------\npost_id: {doc['_id']}\npost content: {doc['text']}\nscore: {score:.4f}\nlabel: {sentiment_label}\n"
+            )
             ops.append(
                 UpdateOne(
                     {"_id": doc["_id"]},
                     {
                         "$set": {
-                            "sentiment.transformer.label": sentiment_label,
-                            "sentiment.transformer.score": score,
-                            "sentiment.transformer.model": MODEL_NAME,
+                            "sentiment.llm.label": sentiment_label,
+                            "sentiment.llm.score": score,
+                            "sentiment.llm.model": MODEL_NAME,
                         }
                     },
                 )
@@ -362,4 +357,3 @@ def run(input_data: Any, context: Dict[str, Any]) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     raise RuntimeError("no.")
-
