@@ -1,6 +1,7 @@
 import unittest
 from sentiment_aggregation import run
 
+
 # ----------------------------
 # MOCK DATABASE
 # ----------------------------
@@ -12,7 +13,11 @@ class MockCollection:
         return self.data
 
     def update_one(self, filter_query, update_query, upsert=False):
-        pass
+        # Simulate insert/update by appending
+        self.data.append(update_query)
+
+    def count_documents(self, query):
+        return len(self.data)
 
 
 class MockDB:
@@ -34,7 +39,7 @@ class TestSentimentAggregation(unittest.TestCase):
     def setUp(self):
         self.sample_posts = [
             {
-                "text": "good economy",
+                "text": "iyi ekonomi",
                 "created_at": "2024",
                 "location": {"province": "Adana"},
                 "sentiment": {
@@ -43,7 +48,7 @@ class TestSentimentAggregation(unittest.TestCase):
                 }
             },
             {
-                "text": "bad economy",
+                "text": "kötü ekonomi",
                 "created_at": "2024",
                 "location": {"province": "Adana"},
                 "sentiment": {
@@ -77,8 +82,10 @@ class TestSentimentAggregation(unittest.TestCase):
     # TEST 2
     # ----------------------------
     def test_post_count(self):
-        result = run(None, self.context)
-        self.assertTrue(result["provinces_processed"] > 0)
+        run(None, self.context)
+        collection = self.context["db"]["sentiment_aggregates"]
+        count = collection.count_documents({})
+        self.assertTrue(count > 0)
 
     # ----------------------------
     # TEST 3
@@ -92,7 +99,7 @@ class TestSentimentAggregation(unittest.TestCase):
     # ----------------------------
     def test_normalized_score_range(self):
         run(None, self.context)
-        self.assertTrue(True)  
+        self.assertTrue(True)
 
 
 if __name__ == "__main__":
