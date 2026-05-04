@@ -39,8 +39,9 @@ def _choose_step_interactively() -> str | None:
         ("2", "Run fetch", "fetch"),
         ("3", "Run preprocess", "preprocess"),
         ("4", "Run sentiment", "sentiment"),
-        ("5", "Run geospatial", "geospatial"),
-        ("6", "Run sentiment_aggregation", "sentiment_aggregation"),
+        ("5", "Run sentiment_llm", "sentiment_llm"),
+        ("6", "Run geospatial", "geospatial"),
+        ("7", "Run sentiment_aggregation", "sentiment_aggregation"),
     ]
 
     print("\nselect task:")
