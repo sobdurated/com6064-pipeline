@@ -20,14 +20,14 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
     aggregates_collection = db["sentiment_aggregates"]
 
     # =============================
-    # FILTERS
+    # FILTERS 
     # =============================
     START_DATE = datetime(1950, 1, 1)
     END_DATE = datetime(2026, 12, 31)
-    #policy = politika 
-    #tourism = turizm 
-    #economy = ekonomi 
-    #weather = hava  
+    #policy = politika
+    #tourism = turizm
+    #economy = ekonomi
+    #weather = hava
     FILTER_KEYWORD = None
     #positive/negative
     FILTER_SENTIMENT = None
@@ -80,19 +80,16 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
                 groups[province].append(post)
 
         # =============================
-        # CALCULATE METRICS
+        # CALCULATE 
         # =============================
         for province, p_list in groups.items():
 
             N_total = len(p_list)
 
-            sentiments = []
-            confidences = []
-
-            for p in p_list:
-                s = p["sentiment"][model_type]
-                sentiments.append(SENTIMENT_MAP[s["label"].lower()])
-                confidences.append(s["score"])
+            sentiments = [
+                SENTIMENT_MAP[p["sentiment"][model_type]["label"].lower()]
+                for p in p_list
+            ]
 
             N_positive = sentiments.count(1)
             N_negative = sentiments.count(-1)
@@ -101,14 +98,6 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
             neg_pct = N_negative / N_total
 
             avg_sent = sum(sentiments) / N_total
-            polarity = (N_positive - N_negative) / N_total
-
-            variance = sum((s - avg_sent) ** 2 for s in sentiments) / N_total
-            volatility = math.sqrt(variance)
-
-            confidence_avg = sum(confidences) / N_total
-            volume_score = N_total * abs(avg_sent)
-
             normalized_score = (avg_sent + 1) / 2
 
             document = {
@@ -120,23 +109,20 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
                     "end": END_DATE
                 },
                 "total_posts": N_total,
-                "average_sentiment": avg_sent,
-                "normalized_score": normalized_score,
-                "polarity": polarity,
-                "volatility": volatility,
-                "confidence": confidence_avg,
-                "volume_score": volume_score,
+                "average_sentiment": round(avg_sent, 2),
+                "normalized_score": round(normalized_score, 2),
                 "distribution": {
                     "positive": N_positive,
                     "negative": N_negative
                 },
                 "ratios": {
-                    "positive": pos_pct,
-                    "negative": neg_pct
+                    "positive": round(pos_pct, 2),
+                    "negative": round(neg_pct, 2)
                 },
                 "last_updated": datetime.now()
             }
 
+           
             print("\n--- RESULT ---")
             print(document)
 
@@ -154,12 +140,10 @@ def run(input_data: Any, context: Dict[str, Any]) -> Any:
 
     print("\n✅ All data processed successfully!")
 
-    
     return {
         "step": STEP_NAME,
         "status": "completed"
     }
-
 
 # References:
 # 1. https://pymongo.readthedocs.io/en/stable/
