@@ -11,7 +11,6 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 SOURCE_COLLECTION = os.getenv("MONGO_SOURCE_COLLECTION", "posts_processed")
 MODEL_NAME = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
 BATCH_SIZE = int(os.getenv("SENTIMENT_BATCH_SIZE", "8"))
-MAX_TEXT_LEN = int(os.getenv("SENTIMENT_MAX_TEXT_LEN", "400"))
 MAX_NEW_TOKENS = 8
 
 SYSTEM_PROMPT = (
@@ -110,6 +109,7 @@ def _load_posts_for_inference(collection) -> List[Dict]:
         "$or": [
             {"sentiment.llm.model": "pending"},
             {"sentiment.llm.label": "neutral"},
+            {"sentiment.llm.model": "savasy/bert-base-turkish-sentiment-cased"},
         ],
     }
     projection = {"_id": 1, "text": 1}
@@ -126,7 +126,9 @@ def _resolve_dataset_path(dataset_path: str, context: Dict[str, Any]) -> str:
     return os.path.join(base_dir, raw_path) if base_dir else raw_path
 
 
-def _load_labeled_samples(csv_path: str, text_column: str, label_column: str, id_column: str) -> List[Dict[str, str]]:
+def _load_labeled_samples(
+    csv_path: str, text_column: str, label_column: str, id_column: str
+) -> List[Dict[str, str]]:
     samples: List[Dict[str, str]] = []
     with open(csv_path, "r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -145,7 +147,11 @@ def _load_labeled_samples(csv_path: str, text_column: str, label_column: str, id
             if not text or normalized_true not in {"positive", "negative"}:
                 continue
 
-            samples.append({"entry_id": str(row.get(id_column, "") or ""), "text": text, "true_label": normalized_true})
+            samples.append({
+                "entry_id": str(row.get(id_column, "") or ""),
+                "text": text,
+                "true_label": normalized_true,
+            })
     return samples
 
 
@@ -220,20 +226,18 @@ def run_sentiment_evaluation(context: Dict[str, Any], evaluation_config: Dict[st
 
     results: List[Dict[str, Any]] = []
     for batch in _chunked(samples, batch_size):
-        texts = [item["text"][:MAX_TEXT_LEN] for item in batch]
+        texts = [item["text"] for item in batch]
         predictions = _infer_batch(tokenizer, model, texts)
 
         for item, (pred_label, score) in zip(batch, predictions):
-            results.append(
-                {
-                    "entry_id": item["entry_id"],
-                    "text": item["text"],
-                    "true_label": item["true_label"],
-                    "predicted_label": pred_label,
-                    "score": score,
-                    "is_error": item["true_label"] != pred_label,
-                }
-            )
+            results.append({
+                "entry_id": item["entry_id"],
+                "text": item["text"],
+                "true_label": item["true_label"],
+                "predicted_label": pred_label,
+                "score": score,
+                "is_error": item["true_label"] != pred_label,
+            })
 
     true_labels = [r["true_label"] for r in results]
     pred_labels = [r["predicted_label"] for r in results]
@@ -291,41 +295,38 @@ def run_sentiment_pipeline(context: Dict[str, Any]) -> Tuple[int, int]:
     print(f"documents to process: {total_posts}")
 
     ops: List[UpdateOne] = []
+    done = 0
     for post_batch in _chunked(posts, BATCH_SIZE):
-        texts = [doc["text"][:MAX_TEXT_LEN] for doc in post_batch]
+        texts = [doc["text"] for doc in post_batch]
         predictions = _infer_batch(tokenizer, model, texts)
 
         for doc, (sentiment_label, score) in zip(post_batch, predictions):
-            print(
-                f"-------------\npost_id: {doc['_id']}\npost content: {doc['text']}\nscore: {score:.4f}\nlabel: {sentiment_label}\n"
-            )
+            print(f"-------------\npost_id: {doc['_id']}\npost content: {doc['text']}\nscore: {score:.4f}\nlabel: {sentiment_label}\n")
             ops.append(
                 UpdateOne(
                     {"_id": doc["_id"]},
-                    {
-                        "$set": {
-                            "sentiment.llm.label": sentiment_label,
-                            "sentiment.llm.score": score,
-                            "sentiment.llm.model": MODEL_NAME,
-                        }
-                    },
+                    {"$set": {
+                        "sentiment.llm.label": sentiment_label,
+                        "sentiment.llm.score": score,
+                        "sentiment.llm.model": MODEL_NAME,
+                    }},
                 )
             )
+        if ops:
+            print(f"committing bulk write for {len(ops)} operations")
+            result = collection.bulk_write(ops, ordered=False)
+            # updated_count = result.modified_count
+            done += result.modified_count
+            print(f"{done}/{total_posts}; remaining {total_posts - done}")
+            ops = []
 
-    updated_count = 0
-    if ops:
-        print(f"committing bulk write for {len(ops)} operations")
-        result = collection.bulk_write(ops, ordered=False)
-        updated_count = result.modified_count
-
-    print(f"updated documents: {updated_count}/{total_posts}")
+    print(f"updated documents: {total_posts}/{total_posts}")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
 
-    return total_posts, updated_count
-
+    return total_posts
 
 def run(input_data: Any, context: Dict[str, Any]) -> Dict[str, Any]:
     print(input_data)
@@ -343,13 +344,12 @@ def run(input_data: Any, context: Dict[str, Any]) -> Dict[str, Any]:
                 },
             }
 
-    total_posts, updated_count = run_sentiment_pipeline(context=context)
+    total_posts = run_sentiment_pipeline(context=context)
     return {
         "previous": input_data,
         "sentiment": {
             "mode": "pipeline",
             "total_posts": total_posts,
-            "updated_count": updated_count,
             "model": MODEL_NAME,
         },
     }
