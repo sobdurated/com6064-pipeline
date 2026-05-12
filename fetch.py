@@ -998,10 +998,13 @@ def expand_one_input_request(item: Dict[str, Any], base_dir: Path) -> List[Dict[
     district_value = str(district_raw).strip() if district_raw not in (None, "", "None") else None
     category_value = str(category_raw).strip() if category_raw not in (None, "", "None") else ALL_VALUE
 
+    # Category is flexible.
+    # category='all' uses the saved categories.csv list.
+    # Any other category text is accepted as-is and used in the search query.
     if is_all_value(category_value):
         selected_categories = all_categories
     else:
-        selected_categories = [find_match_by_normalized(category_value, all_categories, "category")]
+        selected_categories = [category_value]
 
     if is_all_value(province_value):
         selected_provinces = province_options
