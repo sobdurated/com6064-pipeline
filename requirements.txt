@@ -11,6 +11,7 @@ transformers
 tokenizers
 accelerate
 sentencepiece
+bitsandbytes>=0.46.1
 
 # Fetch step (web scraping, API requests, CSV/data handling)
 pandas
