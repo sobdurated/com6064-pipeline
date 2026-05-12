@@ -1,223 +1,441 @@
-COM6064 Pipeline Command Cheat Sheet
-====================================
+# COM6064 Pipeline Command Cheat Sheet
 
 Use these commands from the project root folder.
 
 Example project root:
-C:\Users\HP\OneDrive\Desktop\Pull test 4\com6064-pipeline-main (2)\com6064-pipeline-main
 
+`C:\Users\HP\OneDrive\Desktop\Pull test 4\com6064-pipeline-main (2)\com6064-pipeline-main`
 
-1. Activate virtual environment
--------------------------------
+---
+
+# 1. Activate virtual environment
 
 PowerShell:
 
+```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\venv\Scripts\Activate.ps1
+```
 
 You are ready when you see:
 
+```powershell
 (venv) PS ...
+```
 
+---
 
-2. Install requirements
------------------------
+# 2. Install requirements
 
+```powershell
 pip install -r requirements.txt
+```
 
+---
 
-3. Create or edit .env
-----------------------
+# 3. Create or edit .env
 
+```powershell
 notepad .env
+```
 
-Example .env content:
+Example `.env` content:
 
+```env
 MONGO_URI=mongodb+srv://<username>:<password>@cluster0.xxxxx.mongodb.net/myDatabase?appName=Cluster0
 MONGO_DB_NAME=COM6064
 SERPER_API_KEYS=key1,key2,key3
+```
 
+---
 
-4. Run fetch only with one province, one district, one category
----------------------------------------------------------------
+# 4. Run fetch only with one province, one district, one category
 
+```powershell
 $json='{"max_topics":1,"num_results":1,"province":"Ankara","district":"Nallıhan","category":"yemek"}'
 python pipeline.py --interactive --input $json
+```
 
 Choose:
 
+```text
 2
+```
 
+---
 
-5. Run full pipeline with one province, one district, one category
-------------------------------------------------------------------
+# 5. Run full pipeline with one province, one district, one category
 
+```powershell
 $json='{"max_topics":1,"num_results":1,"province":"Ankara","district":"Nallıhan","category":"yemek"}'
 python pipeline.py --interactive --input $json
+```
 
 Choose:
 
+```text
 1
+```
 
+---
 
-6. Run fetch only with one district and all categories
------------------------------------------------------
+# 6. Run fetch only with one district and all categories
 
+```powershell
 $json='{"max_topics":3,"num_results":3,"province":"Ankara","district":"Ayaş","category":"all"}'
 python pipeline.py --interactive --input $json
+```
 
 Choose:
 
+```text
 2
+```
 
+---
 
-7. Run full pipeline with one district and all categories
---------------------------------------------------------
+# 7. Run full pipeline with one district and all categories
 
+```powershell
 $json='{"max_topics":3,"num_results":3,"province":"Ankara","district":"Ayaş","category":"all"}'
 python pipeline.py --interactive --input $json
+```
 
 Choose:
 
+```text
 1
+```
 
+---
 
-8. Run one province, all districts, one category
-------------------------------------------------
+# 8. Run one province, all districts, one category
 
+```powershell
 $json='{"max_topics":1,"num_results":1,"province":"Ankara","district":"all","category":"konaklama"}'
 python pipeline.py --interactive --input $json
+```
 
 Choose:
 
+```text
 2 for fetch only
 1 for full pipeline
+```
 
+---
 
-9. Run one province, all districts, all categories
---------------------------------------------------
+# 9. Run one province, all districts, all categories
 
+```powershell
 $json='{"max_topics":1,"num_results":1,"province":"Ankara","district":"all","category":"all"}'
 python pipeline.py --interactive --input $json
+```
 
 Choose:
 
+```text
 2 for fetch only
 1 for full pipeline
+```
 
+---
 
-10. Run all provinces, all districts, one category
---------------------------------------------------
+# 10. Run all provinces, all districts, one category
 
+```powershell
 $json='{"max_topics":1,"num_results":1,"province":"all","district":"all","category":"yemek","confirm_bulk":true}'
 python pipeline.py --interactive --input $json
+```
 
 Choose:
 
+```text
 2 for fetch only
+```
 
+---
 
-11. Run all provinces, all districts, all categories
-----------------------------------------------------
+# 11. Run all provinces, all districts, all categories
 
 Warning:
 This is a large run. It may need thousands of Serper API requests.
 
+```powershell
 $json='{"max_topics":1,"num_results":1,"province":"all","district":"all","category":"all","confirm_bulk":true}'
 python pipeline.py --interactive --input $json
+```
 
 Choose:
 
+```text
 2 for fetch only
+```
 
+---
 
-12. Test redundancy
--------------------
+# 12. Run without province, district, or category
+
+This works after the updated `fetch.py`.
+
+```powershell
+$json='{"max_topics":1,"num_results":1}'
+python pipeline.py --interactive --input $json
+```
+
+Choose:
+
+```text
+2 for fetch only
+1 for full pipeline
+```
+
+Meaning:
+
+```text
+All provinces + all districts + all categories
+```
+
+---
+
+# 13. Run one province with all districts and all categories automatically
+
+```powershell
+$json='{"province":"İstanbul","max_topics":1,"num_results":1}'
+python pipeline.py --interactive --input $json
+```
+
+Choose:
+
+```text
+2 for fetch only
+1 for full pipeline
+```
+
+Meaning:
+
+```text
+All districts + all categories inside İstanbul
+```
+
+---
+
+# 14. Run one category across all provinces and districts
+
+```powershell
+$json='{"category":"insanlar","max_topics":1,"num_results":1}'
+python pipeline.py --interactive --input $json
+```
+
+Choose:
+
+```text
+2 for fetch only
+1 for full pipeline
+```
+
+Meaning:
+
+```text
+All provinces + all districts for category insanlar
+```
+
+---
+
+# 15. Run one district across all provinces
+
+```powershell
+$json='{"district":"Kadıköy","category":"insanlar","max_topics":1,"num_results":1}'
+python pipeline.py --interactive --input $json
+```
+
+Choose:
+
+```text
+2 for fetch only
+1 for full pipeline
+```
+
+Meaning:
+
+```text
+Searches every province containing district Kadıköy
+```
+
+---
+
+# 16. Run one district with all categories
+
+```powershell
+$json='{"province":"İstanbul","district":"Kadıköy","max_topics":1,"num_results":1}'
+python pipeline.py --interactive --input $json
+```
+
+Choose:
+
+```text
+2 for fetch only
+1 for full pipeline
+```
+
+Meaning:
+
+```text
+One district + all categories
+```
+
+---
+
+# 17. Bulk protection warning
+
+Large automatic runs may trigger bulk protection.
+
+Example:
+
+```powershell
+$json='{"max_topics":5,"num_results":10}'
+python pipeline.py --interactive --input $json
+```
+
+Fix:
+
+Add:
+
+```json
+"confirm_bulk":true
+```
+
+Example:
+
+```powershell
+$json='{"max_topics":5,"num_results":10,"confirm_bulk":true}'
+python pipeline.py --interactive --input $json
+```
+
+---
+
+# 18. Test redundancy
 
 Run the same command twice.
 
 First run:
 
+```powershell
 $json='{"max_topics":3,"num_results":3,"province":"Ankara","district":"Nallıhan","category":"all"}'
 python pipeline.py --interactive --input $json
+```
 
 Choose:
 
+```text
 2
+```
 
 Second run:
 
+```powershell
 python pipeline.py --interactive --input $json
+```
 
 Choose:
 
+```text
 2
+```
 
 Expected result:
+
+```text
 MongoDB should not add duplicate posts.
 The script should skip completed requests or insert 0 new posts.
+```
 
+---
 
-13. Get more data for the same province, district, category
------------------------------------------------------------
+# 19. Get more data for the same province, district, category
 
-Use force_refresh if your final fetch.py supports it.
+Use `force_refresh` if your final `fetch.py` supports it.
 
+```powershell
 $json='{"max_topics":4,"num_results":4,"province":"Ankara","district":"Nallıhan","category":"all","force_refresh":true}'
 python pipeline.py --interactive --input $json
+```
 
 Choose:
 
+```text
 2
+```
 
 Expected result:
+
+```text
 The script searches again.
 MongoDB still prevents duplicate posts using post_id.
 Only new clean posts should be saved.
+```
 
+---
 
-14. Meaning of max_topics and num_results
------------------------------------------
+# 20. Meaning of max_topics and num_results
 
-num_results:
+`num_results`
+
 How many search result URLs Serper should return.
 
-max_topics:
+`max_topics`
+
 How many of those URLs the scraper should actually scrape.
 
 Example:
 
+```json
 "num_results":3
 "max_topics":3
+```
 
 Meaning:
-1 Serper API call.
-Up to 3 URLs returned.
-Up to 3 topic URLs scraped.
-Each topic can scrape up to 5 pages.
 
+```text
+1 Serper API call
+Up to 3 URLs returned
+Up to 3 topic URLs scraped
+Each topic can scrape up to 5 pages
+```
 
-15. API usage estimate
-----------------------
+---
 
-1 search query = 1 Serper API request.
+# 21. API usage estimate
+
+```text
+1 search query = 1 Serper API request
+```
 
 One province + one district + one category = 1 search query.
 
 Example:
 
+```text
 Ankara + Nallıhan + yemek = 1 API request
+```
 
 If you use:
+
+```text
 districts × categories
+```
 
 Example:
-973 districts × 5 categories = about 4,865 API requests.
 
+```text
+973 districts × 5 categories = about 4,865 API requests
+```
 
-16. Useful Ankara test districts
---------------------------------
+---
 
+# 22. Useful Ankara test districts
+
+```text
 Nallıhan
 Ayaş
 Kızılcahamam
@@ -228,99 +446,134 @@ Kalecik
 Elmadağ
 Evren
 Şereflikoçhisar
+```
 
+---
 
-17. Useful categories
----------------------
+# 23. Useful categories
 
+```text
 yemek
 konaklama
 yerler
 ulaşım
 insanlar
 all
+```
 
+---
 
-18. Check MongoDB records
--------------------------
+# 24. Check MongoDB records
 
 In MongoDB Atlas filter:
 
+```json
 {
   "location.province": "Ankara",
   "location.district": "Nallıhan"
 }
+```
 
 For category:
 
+```json
 {
   "location.province": "Ankara",
   "location.district": "Nallıhan",
   "category": "yemek"
 }
+```
 
 For tags:
 
+```json
 {
   "post_tags": {
     "$all": ["Ankara", "Nallıhan", "yemek"]
   }
 }
+```
 
+---
 
-19. Local output folders
-------------------------
+# 25. Local output folders
 
 Expected local output structure:
 
+```text
 output/raw
 output/clean
 output/invalid
 output/logs
 output/reports
+```
 
 MongoDB should store only clean valid posts in:
 
+```text
 posts_raw
+```
 
+---
 
-20. Success signs
------------------
+# 26. Success signs
 
 Fetch success:
 
+```text
 INFO: Searching Serper
 INFO: Found URL(s)
 INFO: Topic saved immediately
 INFO: MongoDB saved posts into collection 'posts_raw'
+```
 
 Full pipeline success:
 
+```text
 pipeline finished: executed contracts 5/5
 steps summary: attempted=5 | executed=5
+```
 
+---
 
-21. Common errors
------------------
+# 27. Common errors
 
 Error:
+
+```text
 ModuleNotFoundError
+```
 
 Fix:
+
+```powershell
 pip install -r requirements.txt
+```
 
 Error:
+
+```text
 Activate.ps1 cannot be loaded
+```
 
 Fix:
+
+```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\venv\Scripts\Activate.ps1
+```
 
 Error:
+
+```text
 JSON input broken in PowerShell
+```
 
 Fix:
+
 Use variable format:
 
+```powershell
 $json='{"max_topics":1,"num_results":1,"province":"Ankara","district":"Nallıhan","category":"yemek"}'
 python pipeline.py --interactive --input $json
+```
