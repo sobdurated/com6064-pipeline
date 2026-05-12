@@ -405,6 +405,138 @@ Each topic can scrape up to 5 pages
 
 ---
 
+# 20A. How many posts does one query scrape?
+
+Example:
+
+```powershell
+$json='{"max_topics":1,"num_results":1}'
+```
+
+Meaning:
+
+```text
+1 Serper API search request
+↓
+1 topic URL returned
+↓
+Scraper visits:
+?p=1
+?p=2
+?p=3
+?p=4
+?p=5
+```
+
+because fetch.py uses:
+
+```python
+MAX_PAGES_PER_TOPIC = 5
+```
+
+Usually:
+
+```text
+1 page ≈ 10 posts
+```
+
+So:
+
+```text
+1 topic URL ≈ 50 posts maximum
+```
+
+Real results may vary because:
+
+```text
+- duplicates are removed
+- invalid short texts are removed
+- some pages may be empty
+```
+
+---
+
+# 20B. Do pages p1 to p5 use Serper credits?
+
+No.
+
+Only the initial search query uses Serper credits.
+
+Example:
+
+```json
+"num_results":1,
+"max_topics":1
+```
+
+Uses:
+
+```text
+1 Serper API request
+```
+
+Then all page scraping is done for free using:
+
+```text
+- cloudscraper
+- requests
+- BeautifulSoup
+```
+
+So:
+
+```text
+1 Serper credit
+can scrape:
+1 topic URL
++
+pages p1 → p5
++
+roughly 30 to 50 posts
+```
+
+---
+
+# 20C. What controls the number of scraped pages?
+
+Inside fetch.py:
+
+```python
+MAX_PAGES_PER_TOPIC = 5
+```
+
+Current behavior:
+
+```text
+?p=1
+?p=2
+?p=3
+?p=4
+?p=5
+```
+
+If you change:
+
+```python
+MAX_PAGES_PER_TOPIC = 10
+```
+
+Then the scraper visits:
+
+```text
+?p=1 → ?p=10
+```
+
+Possible result:
+
+```text
+~100 posts from one topic URL
+using still:
+1 Serper credit
+```
+
+---
+
 # 21. API usage estimate
 
 ```text
