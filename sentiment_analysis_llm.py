@@ -62,7 +62,7 @@ def _build_sentiment_pipeline():
         torch_dtype=torch.float16,
     )
     model.eval()
-    print(f"model loaded | device map: {model.hf_device_map}")
+    print(f"model loaded | device map: {model.device}")
     return tokenizer, model
 
 
