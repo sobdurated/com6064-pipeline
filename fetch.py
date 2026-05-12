@@ -957,29 +957,67 @@ def load_expansion_sources(base_dir: Path) -> Tuple[List[str], Dict[str, List[st
 
 
 def expand_one_input_request(item: Dict[str, Any], base_dir: Path) -> List[Dict[str, Any]]:
-    """Expand province='all', district='all', and category='all' into real pipeline tasks."""
+    """
+    Convert flexible JSON input into real fetch tasks.
+
+    Supported patterns:
+    - {} or {"max_topics": 1, "num_results": 1}
+      -> all provinces, all categories, province-level search
+
+    - {"province": "İstanbul", "category": "insanlar"}
+      -> İstanbul only, insanlar only, province-level search
+
+    - {"province": "İstanbul", "district": "Kadıköy", "category": "insanlar"}
+      -> one district task
+
+    - {"province": "İstanbul", "district": "all", "category": "insanlar"}
+      -> all İstanbul district tasks
+
+    - {"province": "all", "category": "all"}
+      -> all province-level tasks
+
+    - {"level": "district", "province": "İstanbul", "category": "insanlar"}
+      -> all İstanbul district tasks
+    """
     if not isinstance(item, dict):
         raise ValueError("Each request must be a dictionary")
 
     provinces, district_map, all_categories = load_expansion_sources(base_dir)
+    province_options = list(district_map.keys()) or provinces
 
-    level = str(item.get("level", "district")).strip().lower() or "district"
-    province_value = str(item.get("province", "")).strip()
+    raw_level = item.get("level")
+    level = str(raw_level).strip().lower() if raw_level not in (None, "", "None") else "auto"
+    if level not in {"auto", "province", "district"}:
+        raise ValueError("level must be 'province', 'district', or omitted")
+
+    province_raw = item.get("province")
     district_raw = item.get("district")
+    category_raw = item.get("category")
+
+    province_value = str(province_raw).strip() if province_raw not in (None, "", "None") else ALL_VALUE
     district_value = str(district_raw).strip() if district_raw not in (None, "", "None") else None
-    category_value = str(item.get("category", "")).strip()
+    category_value = str(category_raw).strip() if category_raw not in (None, "", "None") else ALL_VALUE
 
-    if not province_value:
-        raise ValueError("Each request must include province. Use province='all' for all provinces.")
-    if not category_value:
-        raise ValueError("Each request must include category. Use category='all' for all categories.")
-
-    selected_categories = all_categories if is_all_value(category_value) else [category_value]
+    if is_all_value(category_value):
+        selected_categories = all_categories
+    else:
+        selected_categories = [find_match_by_normalized(category_value, all_categories, "category")]
 
     if is_all_value(province_value):
-        selected_provinces = list(district_map.keys())
+        selected_provinces = province_options
     else:
-        selected_provinces = [find_match_by_normalized(province_value, list(district_map.keys()), "province")]
+        selected_provinces = [find_match_by_normalized(province_value, province_options, "province")]
+
+    # Decide the task level automatically when the user does not specify it.
+    # No district means province-level search.
+    # district='all' means expand to district-level searches.
+    if level == "auto":
+        level = "district" if district_value is not None else "province"
+
+    # If the user explicitly says level='district' but does not give a district,
+    # treat it as all districts instead of crashing.
+    if level == "district" and district_value is None:
+        district_value = ALL_VALUE
 
     num_results_default = DISTRICT_RESULTS_COUNT if level == "district" else PROVINCE_RESULTS_COUNT
     num_results = int(item.get("num_results") or num_results_default)
@@ -999,9 +1037,6 @@ def expand_one_input_request(item: Dict[str, Any], base_dir: Path) -> List[Dict[
                     "max_topics": max_topics,
                 })
         return tasks
-
-    if district_value is None:
-        raise ValueError("District-level request must include district. Use district='all' for all districts.")
 
     if is_all_value(district_value):
         for province in selected_provinces:
@@ -1044,9 +1079,8 @@ def expand_one_input_request(item: Dict[str, Any], base_dir: Path) -> List[Dict[
 
     return tasks
 
-
 def input_to_tasks(input_data: Any, base_dir: Path) -> Optional[List[Dict[str, Any]]]:
-    if not isinstance(input_data, dict) or not input_data:
+    if not isinstance(input_data, dict):
         return None
 
     if "requests" in input_data:
@@ -1059,27 +1093,24 @@ def input_to_tasks(input_data: Any, base_dir: Path) -> Optional[List[Dict[str, A
             tasks.extend(expand_one_input_request(item, base_dir))
         return tasks
 
-    if "province" in input_data or "category" in input_data or "district" in input_data:
+    # Any non-empty JSON object is now treated as a valid flexible request.
+    # This allows inputs like {"max_topics": 1, "num_results": 1}.
+    if input_data:
         return expand_one_input_request(input_data, base_dir)
 
     return None
 
 def build_direct_input_from_args(args) -> Dict[str, Any]:
-    if not args.province and not args.category and not args.district:
-        return {}
-
-    if not args.province or not args.category:
-        raise SystemExit("When using direct CLI arguments, --province and --category are required.")
-    if args.level == "district" and not args.district:
-        raise SystemExit("When level is district, --district is required.")
-
     result = {
         "level": args.level,
-        "province": args.province,
-        "district": args.district,
-        "category": args.category,
     }
 
+    if args.province:
+        result["province"] = args.province
+    if args.district:
+        result["district"] = args.district
+    if args.category:
+        result["category"] = args.category
     if args.num_results is not None:
         result["num_results"] = args.num_results
     if args.max_topics is not None:
@@ -1087,8 +1118,13 @@ def build_direct_input_from_args(args) -> Dict[str, Any]:
     if args.include_province_level:
         result["include_province_level"] = True
 
-    return result
+    # If the user did not pass any direct filter, return empty input.
+    # The safety guard in run() will still prevent accidental full-project fetching.
+    meaningful_keys = {"province", "district", "category", "num_results", "max_topics", "include_province_level"}
+    if not any(key in result for key in meaningful_keys):
+        return {}
 
+    return result
 
 def parse_scalar_value(value: str) -> Any:
     value = value.strip().strip('"').strip("'")
