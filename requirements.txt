@@ -7,6 +7,10 @@ transformers==4.41.2
 torch
 numpy
 tqdm
+transformers
+tokenizers
+accelerate
+sentencepiece
 
 # Fetch step (web scraping, API requests, CSV/data handling)
 pandas
