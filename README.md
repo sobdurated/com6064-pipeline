@@ -40,7 +40,32 @@ MONGO_URI=mongodb+srv://<username>:<password>@cluster0...
 MONGO_DB_NAME=COM6064
 ```
 
-## How to Run the Pipeline
+## Running on Google Colab
+
+You can easily run the entire pipeline remotely on a GPU-enabled Google Colab instance, which also acts as a WebSocket server to communicate with the dashboard.
+
+**1. Open the Colab Notebook**
+Click the link below to open the interactive notebook:
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1wD3qc6B8lhK20qRHakRuqX-kJTwsT-p1?usp=sharing)
+
+[Open Colab Notebook](https://colab.research.google.com/drive/1wD3qc6B8lhK20qRHakRuqX-kJTwsT-p1?usp=sharing)
+
+**2. Configure Colab Secrets (API Keys)**
+Before running the notebook, you must configure your API keys and connection strings securely using Colab's built-in Secrets feature.
+1. Look for the **🔑 (Key) icon** on the left sidebar of the Colab notebook.
+2. Add the following secrets (Name and Value):
+   - `MONGO_URI`: Your MongoDB connection string.
+   - `MONGO_DB_NAME`: Your MongoDB database name (e.g., `COM6064`).
+   - `SERPER_API_KEYS`: Your Serper API keys (comma separated).
+   - `NGROK_AUTH_TOKEN`: Your ngrok auth token for exposing the server.
+3. Make sure to toggle **"Notebook access"** to **ON** for all these secrets.
+
+**3. Run the Server**
+1. Ensure the Colab runtime is set to use a GPU: Go to **Runtime** > **Change runtime type** > Select **T4 GPU** (or any available GPU).
+2. Run the single cell in the notebook. It will automatically clone this repository, install dependencies, load the secrets, and start the WebSocket server.
+3. The server's public ngrok URL will be printed in the output. You can use this URL to connect your dashboard to the pipeline.
+
+## How to Run the Pipeline Locally
 
 To run the entire pipeline from start to finish:
 
@@ -53,6 +78,25 @@ To pass initial JSON data into the first step of the pipeline:
 ```bash
 python pipeline.py --input '{"initial_key": "initial_value"}'
 ```
+
+## Running the Server Locally (for Dashboard Integration)
+
+If you want to run the WebSocket server locally (instead of on Colab) to control the pipeline from your dashboard and stream logs, follow these steps:
+
+1. Ensure your `.env` file is properly configured with your secrets (`MONGO_URI`, `MONGO_DB_NAME`, `SERPER_API_KEYS`, etc.).
+2. You can optionally add `NGROK_AUTH_TOKEN=your_token` to your `.env` file if you want to expose the server over the internet.
+3. Run the server script:
+
+```bash
+# Run locally (binds to localhost:5000)
+python server.py
+
+# Or if you want to use ngrok for a public URL, ensure NGROK_AUTH_TOKEN is in your .env
+# or pass it as an argument:
+python server.py --ngrok-token your_token_here
+```
+
+The server will start on `http://127.0.0.1:5000`. You can now connect your dashboard to this URL via WebSocket to trigger runs and receive real-time logs.
 
 ## Developer Guide: Writing Your Step
 

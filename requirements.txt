@@ -7,7 +7,6 @@ transformers==4.41.2
 torch
 numpy
 tqdm
-transformers
 tokenizers
 accelerate
 sentencepiece
@@ -24,5 +23,11 @@ python-dotenv
 emoji
 nltk
 
-# tests
+flask
+flask-socketio
+flask-cors
+simple-websocket
+pyngrok
+
+# Tests
 pytest
