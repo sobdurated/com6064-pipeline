@@ -309,7 +309,7 @@ if __name__ == "__main__":
     from pymongo import MongoClient
     
     # Local test only: creates a temporary client strictly for debugging
-    MONGO_URI = "mongodb+srv://COM6064:OnTHCZcqye91Yv1s@cluster0.bj4tnnh.mongodb.net/COM6064?appName=Cluster0"
+    MONGO_URI = "mongodb://localhost:27017"
     client = MongoClient(MONGO_URI)
     db = client["COM6064"]
     
