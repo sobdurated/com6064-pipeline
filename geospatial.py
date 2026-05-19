@@ -419,7 +419,7 @@ if __name__ == "__main__":
     import os
 
     MONGO_URI = os.getenv("MONGO_URI",
-        "mongodb+srv://COM6064:OnTHCZcqye91Yv1s@cluster0.bj4tnnh.mongodb.net/COM6064?appName=Cluster0")
+        "mongodb://localhost:27017")
     MONGO_DB  = os.getenv("MONGO_DB_NAME", "COM6064")
 
     client  = MongoClient(MONGO_URI)
